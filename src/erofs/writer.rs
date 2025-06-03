@@ -6,6 +6,7 @@ use std::{
     rc::Rc,
 };
 
+use anyhow::Result;
 use log::debug;
 use xxhash_rust::xxh32::xxh32;
 use zerocopy::{Immutable, IntoBytes};
@@ -481,16 +482,19 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         entries.insert(point, entry);
     }
 
-    fn collect_dir(&mut self, dir: &'a tree::Directory<ObjectID>, parent: usize) -> usize {
+    fn collect_dir(&mut self, dir: &'a tree::Directory<ObjectID>, parent: usize) -> Result<usize> {
+        let Some(stat) = dir.stat.as_ref() else {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+        };
         // The root inode number needs to fit in a u16.  That more or less compels us to write the
         // directory inode before the inode of the children of the directory.  Reserve a slot.
-        let me = self.push_inode(&dir.stat, InodeContent::Directory(Directory::default()));
+        let me = self.push_inode(&stat, InodeContent::Directory(Directory::default()));
 
         let mut entries = vec![];
 
         for (name, inode) in dir.sorted_entries() {
             let child = match inode {
-                tree::Inode::Directory(dir) => self.collect_dir(dir, me),
+                tree::Inode::Directory(dir) => self.collect_dir(dir, me)?,
                 tree::Inode::Leaf(leaf) => self.collect_leaf(leaf),
             };
             entries.push(DirEnt {
@@ -506,20 +510,20 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
 
         // Now that we know the actual content, we can write it to our reserved slot
         self.inodes[me].content = InodeContent::Directory(Directory::from_entries(entries));
-        me
+        Ok(me)
     }
 
-    pub fn collect(fs: &'a tree::FileSystem<ObjectID>) -> Vec<Inode<'a, ObjectID>> {
+    pub fn collect(fs: &'a tree::FileSystem<ObjectID>) -> Result<Vec<Inode<'a, ObjectID>>> {
         let mut this = Self {
             inodes: vec![],
             hardlinks: HashMap::new(),
         };
 
         // '..' of the root directory is the root directory again
-        let root_inode = this.collect_dir(&fs.root, 0);
+        let root_inode = this.collect_dir(&fs.root, 0)?;
         assert_eq!(root_inode, 0);
 
-        this.inodes
+        Ok(this.inodes)
     }
 }
 
@@ -688,9 +692,11 @@ impl Output for FirstPass {
     }
 }
 
-pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(fs: &tree::FileSystem<ObjectID>) -> Box<[u8]> {
+pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(
+    fs: &tree::FileSystem<ObjectID>,
+) -> Result<Box<[u8]>> {
     // Create the intermediate representation: flattened inodes and shared xattrs
-    let mut inodes = InodeCollector::collect(fs);
+    let mut inodes = InodeCollector::collect(fs)?;
     let xattrs = share_xattrs(&mut inodes);
 
     // Do a first pass with the writer to determine the layout
@@ -705,5 +711,5 @@ pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(fs: &tree::FileSystem<ObjectID>) 
     write_erofs(&mut second_pass, &inodes, &xattrs);
 
     // That's it
-    second_pass.output.into_boxed_slice()
+    Ok(second_pass.output.into_boxed_slice())
 }

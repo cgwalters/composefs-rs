@@ -224,6 +224,7 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
     }
 
     fn write_dir(&mut self, path: &mut PathBuf, dir: &Directory<ObjectID>) -> Result<()> {
+        let stat = dir.require_stat()?;
         // nlink is 2 + number of subdirectories
         // this is also true for the root dir since '..' is another self-ref
         let nlink = dir.inodes().fold(2, |count, inode| {
@@ -235,9 +236,7 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
             }
         });
 
-        writeln_fmt(self.writer, |fmt| {
-            write_directory(fmt, path, &dir.stat, nlink)
-        })?;
+        writeln_fmt(self.writer, |fmt| write_directory(fmt, path, &stat, nlink))?;
 
         for (name, inode) in dir.sorted_entries() {
             path.push(name);

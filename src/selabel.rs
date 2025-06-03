@@ -224,7 +224,9 @@ fn relabel_inode<H: FsVerityHashValue>(inode: &Inode<H>, path: &mut PathBuf, pol
 }
 
 fn relabel_dir<H: FsVerityHashValue>(dir: &Directory<H>, path: &mut PathBuf, policy: &mut Policy) {
-    relabel(&dir.stat, path, b'd', policy);
+    if let Some(stat) = dir.stat.as_ref() {
+        relabel(stat, path, b'd', policy);
+    }
 
     for (name, inode) in dir.sorted_entries() {
         path.push(name);

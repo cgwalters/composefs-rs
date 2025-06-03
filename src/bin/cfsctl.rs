@@ -210,7 +210,7 @@ async fn main() -> Result<()> {
                 if bootable {
                     fs.transform_for_boot(&repo)?;
                 }
-                let id = fs.compute_image_id();
+                let id = fs.compute_image_id()?;
                 println!("{}", id.to_hex());
             }
             OciCommand::CreateImage {
@@ -296,7 +296,7 @@ async fn main() -> Result<()> {
             if bootable {
                 fs.transform_for_boot(&repo)?;
             }
-            let id = fs.compute_image_id();
+            let id = fs.compute_image_id()?;
             println!("{}", id.to_hex());
         }
         Command::CreateImage {

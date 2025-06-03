@@ -1,3 +1,5 @@
+use std::io;
+
 use anyhow::Result;
 
 use crate::{
@@ -17,7 +19,10 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     ) -> Result<Vec<BootEntry<ObjectID>>> {
         let boot_entries = get_boot_resources(self, repo)?;
         let boot = self.root.get_directory_mut("boot".as_ref())?;
-        boot.stat.st_mtim_sec = 0;
+        let Some(stat) = boot.stat.as_mut() else {
+            return Err(io::Error::from(std::io::ErrorKind::NotFound).into());
+        };
+        stat.st_mtim_sec = 0;
         boot.clear();
 
         selabel(self, repo)?;
@@ -31,12 +36,12 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
         image_name: Option<&str>,
     ) -> Result<ObjectID> {
         self.ensure_root_stat();
-        repository.write_image(image_name, &mkfs_erofs(self))
+        repository.write_image(image_name, &mkfs_erofs(self)?)
     }
 
-    pub fn compute_image_id(&mut self) -> ObjectID {
+    pub fn compute_image_id(&mut self) -> Result<ObjectID> {
         self.ensure_root_stat();
-        compute_verity(&mkfs_erofs(self))
+        Ok(compute_verity(&mkfs_erofs(self)?))
     }
 
     pub fn print_dumpfile(&mut self) -> Result<()> {

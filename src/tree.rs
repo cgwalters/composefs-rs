@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::fsverity::FsVerityHashValue;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Stat {
     pub st_mode: u32,
     pub st_uid: u32,
@@ -43,7 +43,9 @@ pub struct Leaf<ObjectID: FsVerityHashValue> {
 
 #[derive(Debug)]
 pub struct Directory<ObjectID: FsVerityHashValue> {
-    pub stat: Stat,
+    /// This value may not be present for parent directories which are not
+    /// present in a given tar stream.
+    pub stat: Option<Stat>,
     entries: BTreeMap<Box<OsStr>, Inode<ObjectID>>,
 }
 
@@ -68,10 +70,10 @@ pub enum ImageError {
 }
 
 impl<ObjectID: FsVerityHashValue> Inode<ObjectID> {
-    pub fn stat(&self) -> &Stat {
+    pub fn stat(&self) -> Result<&Stat, anyhow::Error> {
         match self {
-            Inode::Directory(dir) => &dir.stat,
-            Inode::Leaf(leaf) => &leaf.stat,
+            Inode::Directory(dir) => dir.require_stat(),
+            Inode::Leaf(leaf) => Ok(&leaf.stat),
         }
     }
 }
@@ -80,13 +82,7 @@ impl<ObjectID: FsVerityHashValue> Inode<ObjectID> {
 impl<ObjectID: FsVerityHashValue> Default for Directory<ObjectID> {
     fn default() -> Self {
         Self {
-            stat: Stat {
-                st_uid: 0,
-                st_gid: 0,
-                st_mode: 0o555,
-                st_mtim_sec: 0,
-                xattrs: Default::default(),
-            },
+            stat: None,
             entries: BTreeMap::default(),
         }
     }
@@ -95,7 +91,7 @@ impl<ObjectID: FsVerityHashValue> Default for Directory<ObjectID> {
 impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
     pub fn new(stat: Stat) -> Self {
         Self {
-            stat,
+            stat: Some(stat),
             entries: BTreeMap::new(),
         }
     }
@@ -103,6 +99,12 @@ impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
     /// Iterates over all inodes in the current directory, in no particular order.
     pub fn inodes(&self) -> impl Iterator<Item = &Inode<ObjectID>> + use<'_, ObjectID> {
         self.entries.values()
+    }
+
+    pub fn require_stat(&self) -> anyhow::Result<&Stat> {
+        self.stat
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound).into())
     }
 
     /// Iterates over all entries in the current directory, in no particular order.  The iterator
@@ -395,7 +397,7 @@ impl<ObjectID: FsVerityHashValue> Directory<ObjectID> {
     }
 
     pub fn newest_file(&self) -> i64 {
-        let mut newest = self.stat.st_mtim_sec;
+        let mut newest = self.stat.as_ref().unwrap().st_mtim_sec;
         for inode in self.entries.values() {
             let mtime = match inode {
                 Inode::Leaf(ref leaf) => leaf.stat.st_mtim_sec,
@@ -427,12 +429,21 @@ impl<ObjectID: FsVerityHashValue> Default for FileSystem<ObjectID> {
 impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     pub fn set_root_stat(&mut self, stat: Stat) {
         self.have_root_stat = true;
-        self.root.stat = stat;
+        self.root.stat = Some(stat);
     }
 
     pub fn ensure_root_stat(&mut self) {
         if !self.have_root_stat {
-            self.root.stat.st_mtim_sec = self.root.newest_file();
+            if self.root.stat.is_none() {
+                self.root.stat = Some(Stat {
+                    st_mode: 0o755,
+                    st_uid: 0,
+                    st_gid: 0,
+                    st_mtim_sec: 0,
+                    xattrs: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+                });
+            }
+            self.root.stat.as_mut().unwrap().st_mtim_sec = self.root.newest_file();
             self.have_root_stat = true;
         }
     }
@@ -477,7 +488,7 @@ mod tests {
     // Helper to create an empty Directory Inode with a specific mtime
     fn new_dir_inode(mtime: i64) -> Inode<Sha256HashValue> {
         Inode::Directory(Box::new(Directory {
-            stat: stat_with_mtime(mtime),
+            stat: Some(stat_with_mtime(mtime)),
             entries: BTreeMap::new(),
         }))
     }
@@ -485,7 +496,7 @@ mod tests {
     // Helper to create a Directory Inode with specific stat
     fn new_dir_inode_with_stat(stat: Stat) -> Inode<Sha256HashValue> {
         Inode::Directory(Box::new(Directory {
-            stat,
+            stat: Some(stat),
             entries: BTreeMap::new(),
         }))
     }
@@ -493,11 +504,11 @@ mod tests {
     #[test]
     fn test_directory_default() {
         let dir = Directory::<Sha256HashValue>::default();
-        assert_eq!(dir.stat.st_uid, 0);
-        assert_eq!(dir.stat.st_gid, 0);
-        assert_eq!(dir.stat.st_mode, 0o555);
-        assert_eq!(dir.stat.st_mtim_sec, 0);
-        assert!(dir.stat.xattrs.borrow().is_empty());
+        assert_eq!(dir.stat.as_ref().unwrap().st_uid, 0);
+        assert_eq!(dir.stat.as_ref().unwrap().st_gid, 0);
+        assert_eq!(dir.stat.as_ref().unwrap().st_mode, 0o555);
+        assert_eq!(dir.stat.as_ref().unwrap().st_mtim_sec, 0);
+        assert!(dir.stat.as_ref().unwrap().xattrs.borrow().is_empty());
         assert!(dir.entries.is_empty());
     }
 
@@ -505,7 +516,7 @@ mod tests {
     fn test_directory_new() {
         let stat = stat_with_mtime(123);
         let dir = Directory::<Sha256HashValue>::new(stat);
-        assert_eq!(dir.stat.st_mtim_sec, 123);
+        assert_eq!(dir.stat.as_ref().unwrap().st_mtim_sec, 123);
         assert!(dir.entries.is_empty());
     }
 
@@ -531,13 +542,13 @@ mod tests {
         assert_eq!(dir.entries.len(), 1);
 
         let retrieved_subdir = dir.get_directory(OsStr::new("subdir")).unwrap();
-        assert_eq!(retrieved_subdir.stat.st_mtim_sec, 20);
+        assert_eq!(retrieved_subdir.stat.as_ref().unwrap().st_mtim_sec, 20);
 
         let retrieved_subdir_opt = dir
             .get_directory_opt(OsStr::new("subdir"))
             .unwrap()
             .unwrap();
-        assert_eq!(retrieved_subdir_opt.stat.st_mtim_sec, 20);
+        assert_eq!(retrieved_subdir_opt.stat.as_ref().unwrap().st_mtim_sec, 20);
     }
 
     #[test]
@@ -617,6 +628,7 @@ mod tests {
                 .get(OsStr::new("item"))
                 .unwrap()
                 .stat()
+                .unwrap()
                 .st_mtim_sec,
             10
         );
@@ -633,7 +645,7 @@ mod tests {
 
         match dir.entries.get(OsStr::new("merged_dir")) {
             Some(Inode::Directory(d)) => {
-                assert_eq!(d.stat.st_mtim_sec, 90); // Stat updated
+                assert_eq!(d.stat.as_ref().unwrap().st_mtim_sec, 90); // Stat updated
                 assert_eq!(d.entries.len(), 1); // Inner file preserved
                 assert!(d.entries.get(OsStr::new("inner_file")).is_some());
             }
@@ -651,6 +663,7 @@ mod tests {
                 .get(OsStr::new("merged_dir"))
                 .unwrap()
                 .stat()
+                .unwrap()
                 .st_mtim_sec,
             100
         );
@@ -660,11 +673,11 @@ mod tests {
     fn test_clear() {
         let mut dir = Directory::<Sha256HashValue>::default();
         dir.insert(OsStr::new("file1"), Inode::Leaf(new_leaf_file(10)));
-        dir.stat.st_mtim_sec = 100;
+        dir.stat.as_mut().unwrap().st_mtim_sec = 100;
 
         dir.clear();
         assert!(dir.entries.is_empty());
-        assert_eq!(dir.stat.st_mtim_sec, 100); // Stat should be unmodified
+        assert_eq!(dir.stat.as_ref().unwrap().st_mtim_sec, 100); // Stat should be unmodified
     }
 
     #[test]
@@ -686,7 +699,7 @@ mod tests {
         }
         assert_eq!(root.newest_file(), 20);
 
-        root.stat.st_mtim_sec = 25;
+        assert_eq!(root.newest_file(), 25);
         assert_eq!(root.newest_file(), 25);
     }
 

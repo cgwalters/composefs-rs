@@ -74,7 +74,8 @@ fn write_directory<ObjectID: FsVerityHashValue>(
     name: &OsStr,
     repo: &Repository<ObjectID>,
 ) -> Result<()> {
-    match mkdirat(dirfd, name, dir.stat.st_mode.into()) {
+    let stat = dir.require_stat()?;
+    match mkdirat(dirfd, name, stat.st_mode.into()) {
         Ok(()) | Err(Errno::EXIST) => {}
         Err(e) => Err(e)?,
     }

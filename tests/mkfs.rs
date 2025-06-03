@@ -17,12 +17,12 @@ use composefs::{
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
-fn debug_fs(mut fs: FileSystem<impl FsVerityHashValue>) -> String {
+fn debug_fs(mut fs: FileSystem<impl FsVerityHashValue>) -> Result<String, anyhow::Error> {
     fs.ensure_root_stat();
     let image = mkfs_erofs(&fs);
     let mut output = vec![];
-    debug_img(&mut output, &image).unwrap();
-    String::from_utf8(output).unwrap()
+    debug_img(&mut output, &image.unwrap())?;
+    Ok(String::from_utf8(output)?)
 }
 
 fn empty(_fs: &mut FileSystem<impl FsVerityHashValue>) {}
@@ -31,7 +31,7 @@ fn empty(_fs: &mut FileSystem<impl FsVerityHashValue>) {}
 fn test_empty() {
     let mut fs = FileSystem::<Sha256HashValue>::default();
     empty(&mut fs);
-    insta::assert_snapshot!(debug_fs(fs));
+    insta::assert_snapshot!(debug_fs(fs).unwrap());
 }
 
 fn add_leaf<ObjectID: FsVerityHashValue>(
@@ -84,7 +84,7 @@ fn simple(fs: &mut FileSystem<Sha256HashValue>) {
 fn test_simple() {
     let mut fs = FileSystem::<Sha256HashValue>::default();
     simple(&mut fs);
-    insta::assert_snapshot!(debug_fs(fs));
+    insta::assert_snapshot!(debug_fs(fs).unwrap());
 }
 
 fn foreach_case(f: fn(&FileSystem<Sha256HashValue>)) {
@@ -97,13 +97,14 @@ fn foreach_case(f: fn(&FileSystem<Sha256HashValue>)) {
 }
 
 #[test_with::executable(fsck.erofs)]
-fn test_fsck() {
+fn test_fsck() -> Result<(), anyhow::Error> {
     foreach_case(|fs| {
         let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(&mkfs_erofs(fs)).unwrap();
+        tmp.write_all(&mkfs_erofs(fs).unwrap()).unwrap();
         let mut fsck = Command::new("fsck.erofs").arg(tmp.path()).spawn().unwrap();
         assert!(fsck.wait().unwrap().success());
     });
+    Ok(())
 }
 
 fn dump_image(img: &[u8]) -> String {
@@ -116,7 +117,7 @@ fn dump_image(img: &[u8]) -> String {
 #[test_with::executable(mkcomposefs)]
 fn test_vs_mkcomposefs() {
     foreach_case(|fs| {
-        let image = mkfs_erofs(fs);
+        let image = mkfs_erofs(fs).unwrap();
 
         let mut mkcomposefs = Command::new("mkcomposefs")
             .args(["--min-version=3", "--from-file", "-", "-"])
