@@ -51,9 +51,6 @@ RUN <<EOF
     semodule_package -o /etc/composefs_workarounds.pp -m /etc/composefs_workarounds.mod
     semodule -i /etc/composefs_workarounds.pp
 
-    # Temporarily set SELinux to permissive to capture AVC denials
-    sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
-
     passwd -d root
     mkdir /sysroot
 EOF
