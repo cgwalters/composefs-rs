@@ -311,16 +311,41 @@ Enables maximum SSH debug logging to capture connection issues.
 
 The test now succeeds with SELinux in permissive mode. The vsock SSH connection completes successfully.
 
-### Proper Long-term Fix
+### SELinux Investigation Results
 
-The current fix (SELinux permissive) is a workaround for debugging. The proper fix would be:
+**Tested approaches**:
 
-1. **Create SELinux policy module** allowing vsock SSH connections
-2. **Pin selinux-policy-targeted** to a version with proper vsock support
-3. **Report bug to Fedora** about SELinux blocking vsock SSH in enforcing mode
-4. **Alternative**: Add SELinux policy rules to the composefs_workarounds.te module
+1. **Specific vsock_socket policy rules** (commit e917ce3): FAILED
+   - Added vsock_socket class with all permissions to composefs_workarounds.te
+   - SELinux in enforcing mode
+   - SSH still failed with "Permission denied [preauth]"
 
-For now, permissive mode allows the tests to pass while the proper SELinux policy is developed.
+2. **Permissive sshd_t domain** (commit b1cdcb3): FAILED
+   - Made only sshd_t domain permissive with `permissive sshd_t;`
+   - SELinux globally in enforcing mode
+   - Added `audit=1` to kernel cmdline
+   - **No AVC denials logged**
+   - SSH still failed with "Permission denied [preauth]"
+
+3. **Global SELinux permissive mode** (commit df7155e): PASSED
+   - Set `SELINUX=permissive` in /etc/selinux/config
+   - All tests pass
+   - **No AVC denials logged even in permissive mode**
+
+**Key finding**: Making only sshd_t permissive doesn't work, but global permissive does. Yet no AVC denials appear in either case with audit logging enabled. This suggests:
+
+- The blocking may involve other SELinux domains (init_t, systemd domains, etc.)
+- OR there are `dontaudit` rules hiding the denials
+- OR the issue is in a different security layer (PAM, OpenSSH internal checks)
+
+**Working solution**: Global SELinux permissive mode
+
+**Proper long-term fix options**:
+
+1. **Investigate which domains are actually blocking** - Use semodule -DB to disable dontaudit rules and see all denials
+2. **Make additional domains permissive** - Beyond sshd_t, try systemd-related domains
+3. **Pin selinux-policy-targeted** to an older version from Oct 3
+4. **Report upstream** to Fedora/SELinux about vsock SSH compatibility issue
 
 ## Testing Instructions
 
