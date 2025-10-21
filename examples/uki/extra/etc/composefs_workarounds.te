@@ -18,7 +18,3 @@ allow sshd_t tmpfs_t:file read;
 
 # for volatile-root workaround
 allow systemd_gpt_generator_t init_var_run_t:lnk_file read;
-
-# Make sshd_t permissive temporarily to capture AVC denials with audit=1
-# This will allow SSH to work while logging what permissions are needed
-permissive sshd_t;

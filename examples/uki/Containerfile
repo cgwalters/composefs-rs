@@ -47,6 +47,32 @@ RUN <<EOF
 
     systemctl enable systemd-networkd
 
+    # Update selinux-policy-targeted to latest version
+    dnf update -y selinux-policy-targeted selinux-policy || true
+
+    # Check if sshd_session_t exists and create appropriate policy
+    if seinfo -t | grep -q sshd_session_t; then
+        echo "sshd_session_t type found in policy"
+        # Use policy with sshd_session_t
+        cat > /etc/composefs_vsock.te <<'POLICY'
+module composefs_vsock 1.0;
+
+require {
+    type sshd_t;
+    type sshd_session_t;
+    class vsock_socket { accept bind connect create getattr getopt listen read setopt shutdown write };
+}
+
+# Allow sshd-session full vsock_socket permissions
+allow sshd_session_t sshd_t:vsock_socket { accept bind connect create getattr getopt listen read setopt shutdown write };
+POLICY
+        checkmodule -M -m -o /etc/composefs_vsock.mod /etc/composefs_vsock.te
+        semodule_package -o /etc/composefs_vsock.pp -m /etc/composefs_vsock.mod
+        semodule -i /etc/composefs_vsock.pp
+    else
+        echo "sshd_session_t type NOT found, skipping vsock policy"
+    fi
+
     checkmodule -M -m -o /etc/composefs_workarounds.mod /etc/composefs_workarounds.te
     semodule_package -o /etc/composefs_workarounds.pp -m /etc/composefs_workarounds.mod
     semodule -i /etc/composefs_workarounds.pp
@@ -61,7 +87,7 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
 
     mkdir -p /etc/kernel /etc/dracut.conf.d
-    echo "composefs=${COMPOSEFS_FSVERITY} rw console=ttyS0,115200n8 audit=1 enforcing=0" > /etc/kernel/cmdline
+    echo "composefs=${COMPOSEFS_FSVERITY} rw console=ttyS0,115200n8" > /etc/kernel/cmdline
 
     kernel-install add-all
 EOF
