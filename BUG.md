@@ -385,6 +385,65 @@ The test now succeeds with SELinux in permissive mode. The vsock SSH connection 
 - OR there are `dontaudit` rules hiding the denials
 - OR the issue is in a different security layer (PAM, OpenSSH internal checks)
 
+### Exact AVC Denials
+
+**CRITICAL FINDING: No AVC denials were logged in ANY test configuration.**
+
+Testing matrix with results:
+
+| Configuration | audit=1 | SELinux Mode | sshd_t | sshd_session_t | SSH Result | AVC Denials |
+|--------------|---------|--------------|--------|----------------|------------|-------------|
+| Enforcing (baseline) | No | enforcing | normal | normal | ✗ FAIL | N/A (no audit) |
+| Enforcing + audit | Yes | enforcing | normal | normal | ✗ FAIL | **NONE** |
+| Permissive + audit | Yes | permissive | normal | normal | ✓ PASS | **NONE** |
+| sshd_t permissive | Yes | enforcing | permissive | normal | ✗ FAIL | **NONE** |
+| Both permissive | Yes | enforcing | permissive | permissive | ✗ FAIL | **NONE** |
+| Global permissive | No | permissive | normal | normal | ✓ PASS | N/A (works) |
+
+**Commands used to search for denials**:
+```bash
+# Search for audit type 1400 (AVC denial)
+grep "type=1400" serial.log
+grep "avc.*denied" serial.log
+
+# Search in journal
+journalctl | grep -i avc
+journalctl -k | grep -i avc
+```
+
+**Result**: Zero AVC denials found in any log file.
+
+**Analysis**: The complete absence of AVC denials even in permissive mode with audit=1 strongly suggests:
+
+1. **dontaudit rules**: SELinux policy contains `dontaudit` rules that suppress logging of these denials
+   - Solution: Run `semodule -DB` to disable dontaudit rules temporarily
+   - This would reveal the actual permission denials
+
+2. **Different blocking mechanism**: The failure may not be SELinux at all
+   - Could be in PAM configuration
+   - Could be in OpenSSH's internal permission checks for vsock sockets
+   - Could be in systemd activation/socket passing
+
+3. **Multi-domain issue**: The denial may involve domain transitions
+   - sshd_t → sshd_session_t transition
+   - systemd socket activation domains
+   - Denials during transition may not be logged the same way
+
+**Expected denials based on BZ#2399770**:
+According to the bug report, the expected denial should be:
+```
+avc: denied { getattr } for pid=2205 comm="sshd-session"
+  scontext=system_u:system_r:sshd_session_t:s0-s0:c0.c1023
+  tcontext=system_u:system_r:sshd_t:s0-s0:c0.c1023
+  tclass=vsock_socket
+```
+
+**But this denial is NOT appearing in our logs**, even though:
+- We have OpenSSH 9.9p1 (with sshd-session split)
+- We have selinux-policy 42.13 (which should include the fix from 42.10)
+- We have audit=1 enabled
+- We have SELinux in permissive mode (which should log would-be denials)
+
 **Working solution**: Global SELinux permissive mode
 
 **Proper long-term fix options**:
@@ -393,6 +452,58 @@ The test now succeeds with SELinux in permissive mode. The vsock SSH connection 
 2. **Make additional domains permissive** - Beyond sshd_t, try systemd-related domains
 3. **Pin selinux-policy-targeted** to an older version from Oct 3
 4. **Report upstream** to Fedora/SELinux about vsock SSH compatibility issue
+
+## Final Iteration - October 21, 2025
+
+### Comprehensive Testing (commits a2c23df → 77a90e0)
+
+**Test sequence on cgwalters fork**:
+
+1. **Commit a2c23df**: Added targeted vsock_socket policy
+   - Added `allow sshd_session_t sshd_t:vsock_socket { getattr };`
+   - Result: ✗ FAIL - SSH still fails in enforcing mode
+
+2. **Commit 813f79e**: Enabled permissive + audit for debugging
+   - Set `enforcing=0 audit=1` in kernel cmdline
+   - Made sshd_t permissive
+   - Result: ✓ PASS (permissive mode)
+   - Finding: **ZERO AVC denials logged**
+
+3. **Commit d381f59**: Comprehensive vsock_socket permissions
+   - Updated selinux-policy-targeted to latest (42.13)
+   - Added all vsock_socket permissions (accept, bind, connect, create, getattr, getopt, listen, read, setopt, shutdown, write)
+   - Result: ✗ FAIL - SSH still fails in enforcing mode
+
+4. **Commit 96ae3b5**: Install setools-console
+   - Fixed sshd_session_t type detection
+   - Confirmed sshd_session_t exists in policy 42.13
+   - Result: ✗ FAIL - SSH still fails in enforcing mode
+
+5. **Commit 05c4159**: Make both sshd_t and sshd_session_t permissive
+   - Added `permissive sshd_t;` and `permissive sshd_session_t;`
+   - SELinux globally in enforcing mode
+   - Result: ✗ FAIL - SSH still fails!
+   - Finding: Making individual domains permissive doesn't work
+
+6. **Commit 77a90e0**: Global SELinux permissive mode
+   - Set `SELINUX=permissive` in /etc/selinux/config
+   - Result: ✅ **PASS** - All tests pass
+   - Run: https://github.com/cgwalters/composefs-rs/actions/runs/18669567500
+
+### Conclusion
+
+The **only working solution** is global SELinux permissive mode via `/etc/selinux/config`.
+
+**Root cause**: Unknown - likely one of:
+- dontaudit rules hiding the actual denials (most likely)
+- Issue in non-SELinux security layer (PAM, OpenSSH internals)
+- Complex multi-domain permission issue not visible in standard audit logs
+
+**Recommended next steps for enforcing mode**:
+1. Run `semodule -DB` to disable dontaudit rules and capture real denials
+2. Investigate systemd socket activation SELinux contexts
+3. Check PAM configuration for vsock-specific issues
+4. Report to Fedora SELinux team with full debug info
 
 ## Testing Instructions
 
