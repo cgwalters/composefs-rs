@@ -50,15 +50,13 @@ RUN <<EOF
     # Update selinux-policy-targeted to latest version
     dnf update -y selinux-policy-targeted selinux-policy || true
 
-    # Set SELinux to permissive mode globally
-    # This is needed for vsock SSH with OpenSSH 9.8+ sshd-session architecture
-    # Even with sshd_t/sshd_session_t domains permissive, no AVC denials appear
-    # and SSH still fails in enforcing mode - likely due to dontaudit rules
-    sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
-
     checkmodule -M -m -o /etc/composefs_workarounds.mod /etc/composefs_workarounds.te
     semodule_package -o /etc/composefs_workarounds.pp -m /etc/composefs_workarounds.mod
     semodule -i /etc/composefs_workarounds.pp
+
+    # Disable dontaudit rules to capture actual AVC denials
+    # This will reveal what permissions are really being denied
+    semodule -DB
 
     passwd -d root
     mkdir /sysroot
@@ -70,7 +68,7 @@ RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
 
     mkdir -p /etc/kernel /etc/dracut.conf.d
-    echo "composefs=${COMPOSEFS_FSVERITY} rw console=ttyS0,115200n8" > /etc/kernel/cmdline
+    echo "composefs=${COMPOSEFS_FSVERITY} rw console=ttyS0,115200n8 audit=1" > /etc/kernel/cmdline
 
     kernel-install add-all
 EOF
