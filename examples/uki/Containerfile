@@ -51,27 +51,26 @@ RUN <<EOF
     dnf update -y selinux-policy-targeted selinux-policy || true
     dnf install -y setools-console || true
 
-    # Check if sshd_session_t exists and create appropriate policy
+    # Check if sshd_session_t exists and make it permissive
     if seinfo -t 2>/dev/null | grep -q sshd_session_t; then
-        echo "sshd_session_t type found in policy"
-        # Use policy with sshd_session_t
-        cat > /etc/composefs_vsock.te <<'POLICY'
-module composefs_vsock 1.0;
+        echo "sshd_session_t type found in policy - making it permissive"
+        # Make sshd_session_t permissive to allow vsock SSH
+        cat > /etc/composefs_sshd_session.te <<'POLICY'
+module composefs_sshd_session 1.0;
 
 require {
-    type sshd_t;
     type sshd_session_t;
-    class vsock_socket { accept bind connect create getattr getopt listen read setopt shutdown write };
 }
 
-# Allow sshd-session full vsock_socket permissions
-allow sshd_session_t sshd_t:vsock_socket { accept bind connect create getattr getopt listen read setopt shutdown write };
+# Make sshd_session_t permissive for vsock SSH
+# No AVC denials appear even with audit=1, but this is needed
+permissive sshd_session_t;
 POLICY
-        checkmodule -M -m -o /etc/composefs_vsock.mod /etc/composefs_vsock.te
-        semodule_package -o /etc/composefs_vsock.pp -m /etc/composefs_vsock.mod
-        semodule -i /etc/composefs_vsock.pp
+        checkmodule -M -m -o /etc/composefs_sshd_session.mod /etc/composefs_sshd_session.te
+        semodule_package -o /etc/composefs_sshd_session.pp -m /etc/composefs_sshd_session.mod
+        semodule -i /etc/composefs_sshd_session.pp
     else
-        echo "sshd_session_t type NOT found, skipping vsock policy"
+        echo "sshd_session_t type NOT found, skipping"
     fi
 
     checkmodule -M -m -o /etc/composefs_workarounds.mod /etc/composefs_workarounds.te
