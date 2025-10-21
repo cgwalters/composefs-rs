@@ -49,9 +49,10 @@ RUN <<EOF
 
     # Update selinux-policy-targeted to latest version
     dnf update -y selinux-policy-targeted selinux-policy || true
+    dnf install -y setools-console || true
 
     # Check if sshd_session_t exists and create appropriate policy
-    if seinfo -t | grep -q sshd_session_t; then
+    if seinfo -t 2>/dev/null | grep -q sshd_session_t; then
         echo "sshd_session_t type found in policy"
         # Use policy with sshd_session_t
         cat > /etc/composefs_vsock.te <<'POLICY'
