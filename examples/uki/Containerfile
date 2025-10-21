@@ -49,29 +49,12 @@ RUN <<EOF
 
     # Update selinux-policy-targeted to latest version
     dnf update -y selinux-policy-targeted selinux-policy || true
-    dnf install -y setools-console || true
 
-    # Check if sshd_session_t exists and make it permissive
-    if seinfo -t 2>/dev/null | grep -q sshd_session_t; then
-        echo "sshd_session_t type found in policy - making it permissive"
-        # Make sshd_session_t permissive to allow vsock SSH
-        cat > /etc/composefs_sshd_session.te <<'POLICY'
-module composefs_sshd_session 1.0;
-
-require {
-    type sshd_session_t;
-}
-
-# Make sshd_session_t permissive for vsock SSH
-# No AVC denials appear even with audit=1, but this is needed
-permissive sshd_session_t;
-POLICY
-        checkmodule -M -m -o /etc/composefs_sshd_session.mod /etc/composefs_sshd_session.te
-        semodule_package -o /etc/composefs_sshd_session.pp -m /etc/composefs_sshd_session.mod
-        semodule -i /etc/composefs_sshd_session.pp
-    else
-        echo "sshd_session_t type NOT found, skipping"
-    fi
+    # Set SELinux to permissive mode globally
+    # This is needed for vsock SSH with OpenSSH 9.8+ sshd-session architecture
+    # Even with sshd_t/sshd_session_t domains permissive, no AVC denials appear
+    # and SSH still fails in enforcing mode - likely due to dontaudit rules
+    sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
 
     checkmodule -M -m -o /etc/composefs_workarounds.mod /etc/composefs_workarounds.te
     semodule_package -o /etc/composefs_workarounds.pp -m /etc/composefs_workarounds.mod

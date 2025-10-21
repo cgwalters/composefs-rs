@@ -18,8 +18,3 @@ allow sshd_t tmpfs_t:file read;
 
 # for volatile-root workaround
 allow systemd_gpt_generator_t init_var_run_t:lnk_file read;
-
-# Make sshd_t permissive for vsock SSH
-# OpenSSH 9.8+ uses sshd_session_t but no AVC denials appear with audit=1
-# Comprehensive vsock_socket permissions don't fix it, so use permissive
-permissive sshd_t;
