@@ -1,0 +1,121 @@
+# Justfile for bootc reverse dependency testing
+# Invoked via: just bootc/<target>
+#
+# This builds and tests bootc against the local composefs-rs checkout
+# using bootc's BOOTC_extra_src mechanism.
+# --------------------------------------------------------------------
+
+# Configuration variables (override via environment or command line)
+# Example: COMPOSEFS_BOOTC_REF=v1.0.0 just bootc/build
+
+# Path to bootc checkout (will be cloned if it doesn't exist)
+path := env("COMPOSEFS_BOOTC_PATH", justfile_directory() + "/../target/bootc")
+# Git ref to checkout for bootc (branch, tag, or PR ref)
+ref := env("COMPOSEFS_BOOTC_REF", "main")
+# Remote repository for bootc
+repo := env("COMPOSEFS_BOOTC_REPO", "https://github.com/bootc-dev/bootc")
+
+# Internal: absolute path to the composefs-rs checkout (parent of this Justfile)
+_composefs_src := justfile_directory() + "/.."
+
+# Clone or update bootc repository
+clone:
+    #!/bin/bash
+    set -euo pipefail
+    if [ -d "{{path}}/.git" ]; then
+        echo "bootc already cloned at {{path}}"
+        echo "To update: cd {{path}} && git fetch && git checkout <ref>"
+    else
+        echo "Cloning bootc from {{repo}} (ref: {{ref}}) to {{path}}"
+        mkdir -p "$(dirname "{{path}}")"
+        # Use --no-checkout with --filter for efficient cloning, then fetch the specific ref
+        # This handles PR refs (refs/pull/123/head) correctly
+        git clone "{{repo}}" "{{path}}" --no-checkout --filter=blob:none
+        cd "{{path}}"
+        git fetch --depth=1 origin "{{ref}}"
+        git checkout FETCH_HEAD
+    fi
+
+# Patch bootc's Cargo.toml to use /run/extra-src paths for composefs-rs
+patch: clone
+    #!/bin/bash
+    set -euo pipefail
+    cd "{{path}}"
+
+    # Check if already patched
+    if grep -q 'Patched by composefs-rs' Cargo.toml 2>/dev/null; then
+        echo "bootc already patched for composefs-rs"
+        exit 0
+    fi
+
+    echo "Patching bootc Cargo.toml to use /run/extra-src for composefs-rs"
+
+    # Add [patch] section using /run/extra-src paths (mounted via BOOTC_extra_src)
+    {
+        echo ''
+        echo '# Patched by composefs-rs CI to test against local composefs-rs'
+        echo '# The /run/extra-src path is bind-mounted via BOOTC_extra_src'
+        echo '[patch."https://github.com/containers/composefs-rs"]'
+        echo 'composefs = { path = "/run/extra-src/crates/composefs" }'
+        echo 'composefs-boot = { path = "/run/extra-src/crates/composefs-boot" }'
+        echo 'composefs-oci = { path = "/run/extra-src/crates/composefs-oci" }'
+    } >> Cargo.toml
+
+    # Patch the workspace lints to allow missing_docs for composefs-rs crates
+    # bootc has workspace.lints.rust.missing_docs = "deny" but composefs-rs has undocumented items
+    sed -i 's/missing_docs = "deny"/missing_docs = "allow"/' Cargo.toml
+
+    echo "bootc patched successfully"
+
+# Build sealed bootc image using local composefs-rs
+build: patch
+    #!/bin/bash
+    set -euo pipefail
+    cd "{{path}}"
+    echo "Building sealed bootc image with BOOTC_extra_src={{_composefs_src}}"
+    BOOTC_extra_src="{{_composefs_src}}" just build-sealed
+
+# Run bootc composefs tests using local composefs-rs
+test: build
+    #!/bin/bash
+    set -euo pipefail
+    cd "{{path}}"
+    echo "Running bootc composefs tests..."
+    # Create /run/extra-src symlink so host cargo commands can resolve the patched paths
+    # (BOOTC_extra_src only mounts inside container builds, not for host cargo)
+    sudo ln -sfn "{{_composefs_src}}" /run/extra-src
+    BOOTC_extra_src="{{_composefs_src}}" just test-composefs
+
+# Clean the bootc checkout and any patches
+clean:
+    #!/bin/bash
+    set -euo pipefail
+    if [ -d "{{path}}" ]; then
+        echo "Removing bootc checkout at {{path}}"
+        rm -rf "{{path}}"
+    else
+        echo "No bootc checkout found at {{path}}"
+    fi
+
+# Show current bootc integration configuration
+config:
+    #!/bin/bash
+    cat <<EOF
+    Bootc Integration Configuration
+    ================================
+    path:  {{path}}
+    ref:   {{ref}}
+    repo:  {{repo}}
+
+    composefs-rs source: {{_composefs_src}}
+
+    Environment Variables:
+      COMPOSEFS_BOOTC_PATH - Override bootc checkout path
+      COMPOSEFS_BOOTC_REF  - Override bootc git ref (branch/tag/PR)
+      COMPOSEFS_BOOTC_REPO - Override bootc git repository
+
+    Example Usage:
+      just bootc/build                              # Clone main, patch, and build
+      COMPOSEFS_BOOTC_REF=v1.2.0 just bootc/build   # Use specific tag
+      COMPOSEFS_BOOTC_REF=refs/pull/1791/head just bootc/build  # Use PR
+    EOF
