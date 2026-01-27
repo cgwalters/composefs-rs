@@ -17,12 +17,14 @@
 //! ├── images/                   # Composefs (erofs) image tracking
 //! │   ├── 4e67eaccd9fd... → ../objects/4e/67eaccd9fd...
 //! │   └── refs/
-//! │       └── myimage → ../4e67eaccd9fd...
+<<<<<<< HEAD
+//! │       └── myimage → ../../4e67eaccd9fd...
 //! └── streams/                  # Splitstream storage
 //!     ├── oci-config-sha256:... → ../objects/XX/YYY...
 //!     ├── oci-layer-sha256:... → ../objects/XX/YYY...
 //!     └── refs/                 # Named references (GC roots)
-//!         └── mytarball → ../oci-layer-sha256:...
+<<<<<<< HEAD
+//!         └── mytarball → ../../oci-layer-sha256:...
 //! ```
 //!
 //! # Object Storage
@@ -713,7 +715,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     ///
     /// The `name` can include path separators to organize refs hierarchically
     /// (e.g., `myapp/layer1`), and intermediate directories are created automatically.
-    #[context("Naming stream '{content_identifier}' as '{name}'")]
+
     pub fn name_stream(&self, content_identifier: &str, name: &str) -> Result<()> {
         let stream_path = Self::format_stream_path(content_identifier);
         let reference_path = format!("streams/refs/{name}");
