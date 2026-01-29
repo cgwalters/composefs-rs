@@ -427,27 +427,58 @@ where
                 let tag_name = name.as_deref().unwrap_or(image);
                 let repo = Arc::new(repo);
 
+                // Check if this is a containers-storage import
                 #[cfg(feature = "containers-storage")]
-                if let Some(image_id) = composefs_oci::cstor::parse_containers_storage_ref(image) {
-                    let (digest, verity) = composefs_oci::cstor::import_from_containers_storage(
-                        &repo,
-                        image_id,
-                        Some(tag_name),
-                    )
-                    .await?;
-                    println!("config {digest}");
-                    println!("verity {}", verity.to_hex());
+                let is_cstor = composefs_oci::cstor::parse_containers_storage_ref(image).is_some();
+                #[cfg(not(feature = "containers-storage"))]
+                let is_cstor = false;
+
+                if is_cstor {
+                    // Use unified pull which handles containers-storage routing
+                    let result =
+                        composefs_oci::pull(&repo, image, Some(tag_name), None).await?;
+
+                    println!("config {}", result.config_digest);
+                    println!("verity {}", result.config_verity.to_hex());
                     println!("tagged {tag_name}");
-                    return Ok(());
+
+                    // Print import statistics if available (containers-storage imports)
+                    #[cfg(feature = "containers-storage")]
+                    if let Some(stats) = result.stats {
+                        println!();
+                        println!("Import statistics:");
+                        println!(
+                            "  layers: {} ({} already present)",
+                            stats.layers, stats.layers_already_present
+                        );
+                        println!(
+                            "  objects: {} total ({} reflinked, {} copied, {} already present)",
+                            stats.total_objects(),
+                            stats.objects_reflinked,
+                            stats.objects_copied,
+                            stats.objects_already_present
+                        );
+                        if stats.used_reflinks() {
+                            println!(
+                                "  reflinked: {} (zero-copy)",
+                                indicatif::HumanBytes(stats.bytes_reflinked)
+                            );
+                        }
+                        if stats.bytes_copied > 0 {
+                            println!("  copied: {}", indicatif::HumanBytes(stats.bytes_copied));
+                        }
+                        println!("  inlined: {}", indicatif::HumanBytes(stats.bytes_inlined));
+                    }
+                } else {
+                    // Use the normal skopeo-based pull which produces full manifest info
+                    let result =
+                        composefs_oci::pull_image(&repo, image, Some(tag_name), None).await?;
+
+                    println!("manifest {}", result.manifest_digest);
+                    println!("config   {}", result.config_digest);
+                    println!("verity   {}", result.manifest_verity.to_hex());
+                    println!("tagged   {tag_name}");
                 }
-
-                let result =
-                    composefs_oci::pull_image(&repo, image, Some(tag_name), None).await?;
-
-                println!("manifest {}", result.manifest_digest);
-                println!("config   {}", result.config_digest);
-                println!("verity   {}", result.manifest_verity.to_hex());
-                println!("tagged   {tag_name}");
             }
             OciCommand::ListImages { json } => {
                 let images = composefs_oci::oci_image::list_images(&repo)?;
