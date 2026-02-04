@@ -56,6 +56,7 @@ jobs:
         sudo apt-get install -y \
           erofs-utils \
           fsverity \
+          just \
           mtools \
           python3-pytest-asyncio \
           qemu-kvm \
@@ -88,8 +89,8 @@ jobs:
       run: sudo cp examples/bls/test-thing.workarounds/systemd-ssh-proxy /usr/lib/systemd
 
     - name: Run example tests
-      run: |
-        export PATH="${HOME}/bin:${PATH}"
-        export FS_FORMAT=${{ matrix.example.fsfmt }}
-        export FS_VERITY_MODE=${{ matrix.example.verity }}
-        examples/test/run ${{ matrix.example.dir }} ${{ matrix.example.os }}
+      run: just test-example ${{ matrix.example.dir }} ${{ matrix.example.os }}
+      env:
+        PATH: "${{ env.HOME }}/bin:${{ env.PATH }}"
+        FS_FORMAT: ${{ matrix.example.fsfmt }}
+        FS_VERITY_MODE: ${{ matrix.example.verity }}

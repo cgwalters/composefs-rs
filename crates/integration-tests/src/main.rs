@@ -6,6 +6,9 @@ use anyhow::Result;
 use integration_tests::{get_all_images, run_bcvk, run_cfsctl};
 use libtest_mimic::{Arguments, Failed, Trial};
 
+type SimpleTest = (&'static str, fn() -> Result<()>);
+type ParameterizedTest = (&'static str, fn(&str) -> Result<()>);
+
 // ============================================================================
 // Test implementations
 // ============================================================================
