@@ -12,7 +12,7 @@ use std::{cmp::Reverse, process::Command, thread::available_parallelism};
 
 use std::{iter::zip, sync::Arc};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
 use containers_image_proxy::{
     ConvertedLayerInfo, ImageProxy, ImageProxyConfig, OpenedImage, Transport,
@@ -22,7 +22,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, MediaType};
 use rustix::process::geteuid;
 use tokio::{
-    io::{AsyncReadExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     sync::Semaphore,
     task::JoinSet,
 };
@@ -189,19 +189,47 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             let progress = bar.wrap_async_read(blob_reader);
             self.progress.println(format!("Fetching layer {diff_id}"))?;
 
-            let reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send> =
-                match descriptor.media_type() {
-                    MediaType::ImageLayer => Box::new(BufReader::new(progress)),
-                    MediaType::ImageLayerGzip => {
-                        Box::new(BufReader::new(GzipDecoder::new(BufReader::new(progress))))
-                    }
-                    MediaType::ImageLayerZstd => {
-                        Box::new(BufReader::new(ZstdDecoder::new(BufReader::new(progress))))
-                    }
-                    other => bail!("Unsupported layer media type {other:?}"),
-                };
+            let object_id = match descriptor.media_type() {
+                // Tar layers: decompress and split into a splitstream
+                MediaType::ImageLayer | MediaType::ImageLayerGzip | MediaType::ImageLayerZstd => {
+                    let reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send> =
+                        match descriptor.media_type() {
+                            MediaType::ImageLayer => Box::new(BufReader::new(progress)),
+                            MediaType::ImageLayerGzip => {
+                                Box::new(BufReader::new(GzipDecoder::new(BufReader::new(progress))))
+                            }
+                            MediaType::ImageLayerZstd => {
+                                Box::new(BufReader::new(ZstdDecoder::new(BufReader::new(progress))))
+                            }
+                            _ => unreachable!(),
+                        };
+                    split_async(reader, self.repo.clone(), TAR_LAYER_CONTENT_TYPE).await?
+                }
 
-            let object_id = split_async(reader, self.repo.clone(), TAR_LAYER_CONTENT_TYPE).await?;
+                // Non-tar layers (OCI artifacts like SBOMs, disk images,
+                // etc.): stream the raw bytes into a repository object and
+                // create a splitstream with a single external reference.
+                // This avoids buffering arbitrarily large blobs in memory
+                // and lets callers get an fd to the object directly via
+                // open_object().
+                _other => {
+                    let tmpfile = self.repo.create_object_tmpfile()?;
+                    let mut writer = tokio::fs::File::from(std::fs::File::from(tmpfile));
+                    let mut reader = progress;
+                    let size = tokio::io::copy(&mut reader, &mut writer).await?;
+                    writer.flush().await?;
+                    let tmpfile = writer.into_std().await;
+                    driver.await?;
+                    let object_id = self.repo.finalize_object_tmpfile(tmpfile, size)?;
+
+                    let mut stream = self.repo.create_stream(OCI_BLOB_CONTENT_TYPE);
+                    stream.add_external_size(size);
+                    stream.write_reference(object_id)?;
+                    // write_stream handles both object storage and stream
+                    // registration, so we return directly.
+                    return self.repo.write_stream(stream, &content_id, None);
+                }
+            };
 
             // skopeo is doing data checksums for us to make sure the content we received is equal
             // to the claimed diff_id. We trust it, but we need to check it by awaiting the driver.
@@ -260,10 +288,25 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             let (config, driver) = tokio::join!(config, driver);
             let _: () = driver?;
             let raw_config = config?;
-            let config = ImageConfiguration::from_reader(&raw_config[..])?;
+
+            // Per the OCI artifacts guidance [1], artifact configs use the
+            // empty descriptor (`application/vnd.oci.empty.v1+json`) or a
+            // custom media type — not a standard image config. In that case
+            // there are no diff_ids, so we use the manifest layer digests.
+            // [1]: https://github.com/opencontainers/image-spec/blob/main/artifacts-guidance.md
+            let is_image_config = *descriptor.media_type() == MediaType::ImageConfig;
+            let diff_ids: Vec<String> = if is_image_config {
+                let config = ImageConfiguration::from_reader(&raw_config[..])?;
+                config.rootfs().diff_ids().to_vec()
+            } else {
+                manifest_layers
+                    .iter()
+                    .map(|d| d.digest().to_string())
+                    .collect()
+            };
 
             // Sort layers by size for parallel fetching
-            let mut layers: Vec<_> = zip(manifest_layers, config.rootfs().diff_ids()).collect();
+            let mut layers: Vec<_> = zip(manifest_layers, &diff_ids).collect();
             layers.sort_by_key(|(mld, ..)| Reverse(mld.size()));
 
             let threads = available_parallelism()?;

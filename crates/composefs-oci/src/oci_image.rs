@@ -123,12 +123,16 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             MediaType::ImageConfig => {
                 let mut stream = config_stream;
                 let config = ImageConfiguration::from_reader(&mut stream)?;
+                // For container images, layer refs are in the config stream
                 let refs = stream.into_named_refs();
                 (Some(config), refs)
             }
             _ => {
-                // Artifact - config may not be a valid ImageConfiguration
-                (None, config_stream.into_named_refs())
+                // Artifact - layer refs are in the manifest's named refs
+                // (the config stream has no named refs for artifacts)
+                let mut refs = named_refs.clone();
+                refs.remove(config_key.as_str());
+                (None, refs)
             }
         };
 
@@ -217,6 +221,49 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
     /// Returns whether this image has been sealed.
     pub fn is_sealed(&self) -> bool {
         self.seal_digest().is_some()
+    }
+
+    /// Opens an artifact layer's backing object by index, returning a
+    /// read-only file descriptor to the raw blob data.
+    ///
+    /// This only works for non-tar layers (OCI artifacts). Returns an
+    /// error for tar layers — use the splitstream API for those.
+    pub fn open_layer_fd(
+        &self,
+        repo: &Repository<ObjectID>,
+        index: usize,
+    ) -> Result<rustix::fd::OwnedFd> {
+        let descriptor = self
+            .manifest
+            .layers()
+            .get(index)
+            .with_context(|| format!("Layer index {index} out of range"))?;
+
+        ensure!(
+            !is_tar_media_type(descriptor.media_type()),
+            "open_layer_fd does not support tar layers (media type: {}); \
+             use the splitstream API instead",
+            descriptor.media_type()
+        );
+
+        let diff_id: &str = descriptor.digest().as_ref();
+        let layer_verity = self
+            .layer_verity(diff_id)
+            .with_context(|| format!("No verity for layer {diff_id}"))?;
+
+        let content_id = crate::layer_identifier(diff_id);
+        let mut stream = repo.open_stream(&content_id, Some(layer_verity), None)?;
+
+        // Artifact layers are stored as a single object; the splitstream
+        // exists only for GC tracking.
+        let mut object_refs = vec![];
+        stream.get_object_refs(|id| object_refs.push(id.clone()))?;
+        ensure!(
+            object_refs.len() == 1,
+            "Expected exactly 1 external ref for artifact layer, got {}",
+            object_refs.len()
+        );
+        repo.open_object(&object_refs[0])
     }
 
     /// Returns the layer diff_ids (for container images).
@@ -459,6 +506,19 @@ pub fn manifest_identifier(digest: &str) -> String {
     format!("oci-manifest-{digest}")
 }
 
+/// Returns true if this is a tar-based layer media type.
+fn is_tar_media_type(media_type: &MediaType) -> bool {
+    matches!(
+        media_type,
+        MediaType::ImageLayer
+            | MediaType::ImageLayerGzip
+            | MediaType::ImageLayerZstd
+            | MediaType::ImageLayerNonDistributable
+            | MediaType::ImageLayerNonDistributableGzip
+            | MediaType::ImageLayerNonDistributableZstd
+    )
+}
+
 /// Returns the reference path for an OCI name.
 fn oci_ref_path(name: &str) -> String {
     format!("{OCI_REF_PREFIX}{}", encode_tag(name))
@@ -553,6 +613,8 @@ mod test {
         ConfigBuilder, DescriptorBuilder, Digest as OciDigest, ImageConfigurationBuilder,
         ImageManifestBuilder, RootFsBuilder,
     };
+    use std::fs::File;
+    use std::io::Read;
     use std::str::FromStr;
 
     /// Helper to create a synthetic container image in the repository.
@@ -871,6 +933,278 @@ mod test {
         // Verify we can read the blob back
         let read_wasm = open_blob(&repo, &blob_digest, Some(&blob_verity)).unwrap();
         assert_eq!(read_wasm, wasm_bytes);
+    }
+
+    /// Test the OCI 1.1 empty config artifact pattern from the spec:
+    /// config is `application/vnd.oci.empty.v1+json`, layers use custom
+    /// media types, and layer digests are used as diff_ids.
+    /// See: https://github.com/opencontainers/image-spec/blob/main/artifacts-guidance.md
+    #[test]
+    fn test_oci_artifact_empty_config() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let sbom_data = br#"{"spdxVersion":"SPDX-2.3","name":"example"}"#;
+        let layer_digest = hash(sbom_data);
+
+        // Store the raw layer as an object with external ref splitstream
+        let blob_object_id = repo.ensure_object(sbom_data).unwrap();
+        let layer_content_id = crate::layer_identifier(&layer_digest);
+        let mut layer_stream = repo.create_stream(crate::skopeo::OCI_BLOB_CONTENT_TYPE);
+        layer_stream.add_external_size(sbom_data.len() as u64);
+        layer_stream
+            .write_reference(blob_object_id.clone())
+            .unwrap();
+        let layer_verity = repo
+            .write_stream(layer_stream, &layer_content_id, None)
+            .unwrap();
+
+        // The OCI 1.1 empty config: `{}` with the well-known digest
+        let empty_config = b"{}";
+        let config_digest = hash(empty_config);
+        assert_eq!(
+            config_digest,
+            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        );
+
+        // Store the config — for artifacts we still write it as a config
+        // splitstream, but it contains no diff_ids-derived named refs.
+        // Instead, the layer refs come from the manifest layer digests.
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        config_stream.write_inline(empty_config);
+        let config_verity = repo
+            .write_stream(
+                config_stream,
+                &crate::config_identifier(&config_digest),
+                None,
+            )
+            .unwrap();
+
+        // Build a spec-conformant artifact manifest with EmptyJSON config
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::EmptyJSON)
+            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .size(empty_config.len() as u64)
+            .build()
+            .unwrap();
+
+        let layer_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::Other("text/spdx+json".to_string()))
+            .digest(OciDigest::from_str(&layer_digest).unwrap())
+            .size(sbom_data.len() as u64)
+            .build()
+            .unwrap();
+
+        let manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor.clone())
+            .layers(vec![layer_descriptor])
+            .build()
+            .unwrap();
+
+        // Verify: EmptyJSON config is NOT an image config
+        assert_ne!(*config_descriptor.media_type(), MediaType::ImageConfig);
+
+        // Store manifest — layer_verities uses the layer digest as key
+        // (same logic as ensure_config_with_layers when !is_image_config)
+        let mut layer_verities = HashMap::new();
+        layer_verities.insert(layer_digest.clone().into_boxed_str(), layer_verity.clone());
+
+        let manifest_json = manifest.to_string().unwrap();
+        let manifest_digest = hash(manifest_json.as_bytes());
+
+        let (_stored_digest, manifest_verity) = write_manifest(
+            &repo,
+            &manifest,
+            &manifest_digest,
+            &config_verity,
+            &layer_verities,
+            Some("my-sbom:v1"),
+        )
+        .unwrap();
+
+        // Verify the image opens and is not a container image
+        let opened = OciImage::open(&repo, &manifest_digest, Some(&manifest_verity)).unwrap();
+        assert!(!opened.is_container_image());
+        assert_eq!(opened.layer_descriptors().len(), 1);
+        assert_eq!(
+            opened.layer_descriptors()[0].media_type(),
+            &MediaType::Other("text/spdx+json".to_string())
+        );
+
+        // Verify open_layer_fd gives us a readable fd to the raw blob
+        let fd = opened.open_layer_fd(&repo, 0).unwrap();
+        let mut recovered = vec![];
+        File::from(fd).read_to_end(&mut recovered).unwrap();
+        assert_eq!(recovered, sbom_data);
+
+        // Out of range index should fail
+        assert!(opened.open_layer_fd(&repo, 1).is_err());
+
+        // Verify GC keeps everything when tagged
+        let gc = repo.gc(&[]).unwrap();
+        assert_eq!(gc.objects_removed, 0);
+
+        // Verify untagging makes it collectible
+        untag_image(&repo, "my-sbom:v1").unwrap();
+        let gc = repo.gc(&[]).unwrap();
+        assert!(gc.objects_removed > 0);
+    }
+
+    /// Test that open_layer_fd rejects tar layers.
+    #[test]
+    fn test_open_layer_fd_rejects_tar() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (digest, verity, _) = create_test_image(repo, Some("myimage:v1"), "amd64");
+        let img = OciImage::open(&repo, &digest, Some(&verity)).unwrap();
+        assert!(img.is_container_image());
+
+        // Tar layer should be rejected
+        let err = img.open_layer_fd(&repo, 0).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("does not support tar layers"), "got: {msg}");
+    }
+
+    /// Test storing a non-tar layer as a splitstream with a single
+    /// external reference, simulating how `ensure_layer` handles
+    /// non-tar media types. The raw bytes go into objects/ and a
+    /// tiny splitstream holds the reference for GC tracking.
+    #[test]
+    fn test_non_tar_layer_storage() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let sbom_data = br#"{"spdxVersion":"SPDX-2.3","name":"example"}"#;
+        let diff_id = hash(sbom_data);
+
+        // Store the raw bytes as a repository object
+        let object_id = repo.ensure_object(sbom_data).unwrap();
+
+        // Create a splitstream with a single external ref (matches ensure_layer)
+        let content_id = crate::layer_identifier(&diff_id);
+        let mut stream = repo.create_stream(crate::skopeo::OCI_BLOB_CONTENT_TYPE);
+        stream.add_external_size(sbom_data.len() as u64);
+        stream.write_reference(object_id.clone()).unwrap();
+        let stream_verity = repo.write_stream(stream, &content_id, None).unwrap();
+
+        // Verify has_stream finds it
+        let found = repo.has_stream(&content_id).unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), stream_verity);
+
+        // Verify we can get the external ref back from the splitstream
+        let mut reader = repo
+            .open_stream(
+                &content_id,
+                Some(&stream_verity),
+                Some(crate::skopeo::OCI_BLOB_CONTENT_TYPE),
+            )
+            .unwrap();
+        let mut refs = vec![];
+        reader.get_object_refs(|id| refs.push(id.clone())).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], object_id);
+
+        // Verify we can open the raw object and read the data back
+        let mut recovered = vec![];
+        File::from(repo.open_object(&object_id).unwrap())
+            .read_to_end(&mut recovered)
+            .unwrap();
+        assert_eq!(recovered, sbom_data);
+    }
+
+    /// Test that a non-tar artifact layer (stored as an external ref)
+    /// is preserved by GC when referenced from a tagged manifest.
+    #[test]
+    fn test_non_tar_artifact_gc() {
+        use containers_image_proxy::oci_spec::image::{
+            DescriptorBuilder, Digest as OciDigest, ImageManifestBuilder,
+        };
+        use std::str::FromStr;
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // Store the raw blob as an object
+        let sbom_data = br#"{"spdxVersion":"SPDX-2.3","name":"example"}"#;
+        let diff_id = hash(sbom_data);
+        let blob_object_id = repo.ensure_object(sbom_data).unwrap();
+
+        // Create a splitstream with external ref (matches ensure_layer)
+        let layer_content_id = crate::layer_identifier(&diff_id);
+        let mut layer_stream = repo.create_stream(crate::skopeo::OCI_BLOB_CONTENT_TYPE);
+        layer_stream.add_external_size(sbom_data.len() as u64);
+        layer_stream
+            .write_reference(blob_object_id.clone())
+            .unwrap();
+        let layer_verity = repo
+            .write_stream(layer_stream, &layer_content_id, None)
+            .unwrap();
+
+        // Store a minimal config
+        let config_bytes = b"{}";
+        let config_digest = hash(config_bytes);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        config_stream.write_inline(config_bytes);
+        let config_verity = repo
+            .write_stream(
+                config_stream,
+                &crate::config_identifier(&config_digest),
+                None,
+            )
+            .unwrap();
+
+        // Build and store a manifest referencing both
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageConfig)
+            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .size(config_bytes.len() as u64)
+            .build()
+            .unwrap();
+        let layer_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::Other("text/spdx+json".to_string()))
+            .digest(OciDigest::from_str(&diff_id).unwrap())
+            .size(sbom_data.len() as u64)
+            .build()
+            .unwrap();
+        let manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor)
+            .layers(vec![layer_descriptor])
+            .build()
+            .unwrap();
+
+        let mut layer_verities = HashMap::new();
+        layer_verities.insert(diff_id.clone().into_boxed_str(), layer_verity);
+
+        let manifest_json = manifest.to_string().unwrap();
+        let manifest_digest = hash(manifest_json.as_bytes());
+
+        let (_stored_digest, _manifest_verity) = write_manifest(
+            &repo,
+            &manifest,
+            &manifest_digest,
+            &config_verity,
+            &layer_verities,
+            Some("my-sbom:v1"),
+        )
+        .unwrap();
+
+        // GC should preserve everything — the blob object is reachable via
+        // manifest → config named ref → layer splitstream → external ref
+        let gc = repo.gc(&[]).unwrap();
+        assert_eq!(gc.objects_removed, 0, "tagged artifact should be preserved");
+
+        // Verify we can still get an fd to the raw blob object
+        let mut recovered = vec![];
+        File::from(repo.open_object(&blob_object_id).unwrap())
+            .read_to_end(&mut recovered)
+            .unwrap();
+        assert_eq!(recovered, sbom_data);
     }
 
     /// Test storing and listing multiple container images.
