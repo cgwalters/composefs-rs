@@ -60,6 +60,14 @@ Branch: `sealing-impl` (based on `oci-native-layer` / PR #216)
   - Fixed -noverify in docs and tests
   - Trust model documented (application-level vs kernel-level signatures)
 - [x] Tests: 79 passing in composefs-oci (with signing), 9 shell tests
+- [x] FUSE verified object opens (`VerifiedObject` enum, `VerifyMode`)
+  - `open_object_verified()`: kernel fsverity fast path → userspace fallback
+  - `VerifiedObject::Fd` (kernel-verified) vs `VerifiedObject::Data` (no TOCTOU)
+  - FUSE daemon uses `VerifyMode::Always` by default
+  - Fixed `mount_fuse()` to use calling user UID/GID
+- [x] Unprivileged verification architecture documented in spec + impl doc
+  - FUSE becomes enforcement point when kernel path unavailable
+  - Trust store options: file-based, user keyring, per-repository
 
 ## Remaining
 
@@ -68,17 +76,19 @@ Branch: `sealing-impl` (based on `oci-native-layer` / PR #216)
 - [ ] Wire up PKCS#7 blob verification in `cfsctl oci verify --cert`
   - Need to fetch blobs from artifact layers via `open_blob()`
   - Then verify with `FsVeritySignatureVerifier`
+- [ ] FUSE mount-time signature artifact verification
+  - Verify signature artifacts against trusted certs before serving
+  - `--trust-cert` flag on FUSE mount command
 - [ ] Registry push/pull for signature artifacts
   - Push artifact manifest + blobs alongside image
   - Query `/referrers/{digest}` API during pull
-- [ ] Per-layer EROFS persistence
-  - Currently per-layer digests are computed transiently
-  - Could store per-layer EROFS in repo for later verification
 - [ ] `cfsctl seal --sign` convenience command
   - Seal + create signature artifact in one step
 - [ ] Kernel-level signature enforcement integration testing
   - Requires VM with ext4/btrfs + `.fs-verity` keyring configured
   - Test `enable_verity_raw_with_sig` with real filesystem
+- [ ] Linux user keyring integration for trust certificates
+  - Read certs from `@u` keyring via `keyutils`
 - [ ] Cosign/sigstore integration
   - Sign/verify the signature artifact manifest itself
 
