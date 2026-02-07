@@ -60,14 +60,14 @@ Branch: `sealing-impl` (based on `oci-native-layer` / PR #216)
   - Fixed -noverify in docs and tests
   - Trust model documented (application-level vs kernel-level signatures)
 - [x] Tests: 79 passing in composefs-oci (with signing), 9 shell tests
-- [x] FUSE verified object opens (`VerifiedObject` enum, `VerifyMode`)
-  - `open_object_verified()`: kernel fsverity fast path → userspace fallback
-  - `VerifiedObject::Fd` (kernel-verified) vs `VerifiedObject::Data` (no TOCTOU)
-  - FUSE daemon uses `VerifyMode::Always` by default
+- [x] FUSE daemon uses `repo.open_object()` directly
+  - Same verification path as kernel EROFS mount
+  - fsverity checked by kernel at `open_object()` time if enabled on repo filesystem
+  - Insecure mode: objects served without verification (same as kernel path)
   - Fixed `mount_fuse()` to use calling user UID/GID
 - [x] Unprivileged verification architecture documented in spec + impl doc
-  - FUSE becomes enforcement point when kernel path unavailable
-  - Trust store options: file-based, user keyring, per-repository
+  - Privileged vs unprivileged is about mount capability, not verification strategy
+  - Trust store options for image-level signatures: file-based, user keyring, per-repository
 
 ## Remaining
 
@@ -77,7 +77,7 @@ Branch: `sealing-impl` (based on `oci-native-layer` / PR #216)
   - Need to fetch blobs from artifact layers via `open_blob()`
   - Then verify with `FsVeritySignatureVerifier`
 - [ ] FUSE mount-time signature artifact verification
-  - Verify signature artifacts against trusted certs before serving
+  - Verify image-level signature artifacts against trusted certs before mounting
   - `--trust-cert` flag on FUSE mount command
 - [ ] Registry push/pull for signature artifacts
   - Push artifact manifest + blobs alongside image

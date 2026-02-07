@@ -192,31 +192,19 @@ There are two paths for running composefs without root privileges, each with dif
 
 **Non-root mounting helper.** A separate composefs-mount-helper service would accept dumpfiles from unprivileged users, generate EROFS images, validate fsverity, and return mount file descriptors. This avoids FUSE entirely and gets kernel-level fsverity, but requires a privileged system service with careful input validation on the dumpfile format. Not all environments will have this service available.
 
-**FUSE daemon with userspace verification.** The `composefs-fuse` crate (`crates/composefs-fuse/`) provides a FUSE-based mount path that requires no privileges beyond FUSE access. This is currently functional for serving files but does not perform any signature or digest verification. The following changes are needed to make it a proper verification enforcement point.
+**FUSE daemon.** The `composefs-fuse` crate (`crates/composefs-fuse/`) provides a FUSE-based mount path that requires no privileges beyond FUSE access. The FUSE daemon uses the same `repo.open_object()` path as the kernel EROFS mount to access content objects from the repository. Object-level integrity is determined by the repository's filesystem: if fsverity is enabled, the kernel verifies objects at `open_object()` time; if the repository is in insecure mode, objects are served without verification. This is identical to the kernel EROFS path — the privileged vs unprivileged distinction is about mount capability, not verification strategy.
 
-**FUSE daemon changes** (`crates/composefs-fuse/`):
+**Completed FUSE changes:**
 
-The `mount_fuse()` function currently hardcodes `user_id=0` in the FUSE mount options, which prevents non-root users from accessing the mount. This needs to use the calling user's UID and GID instead.
+The `mount_fuse()` function was updated to use the calling user's UID and GID instead of hardcoding `user_id=0`, which previously prevented non-root users from accessing the mount.
 
-`TreeFuse` serves file content via `pread()` without verifying object integrity. At `open()` time, the daemon should compute the object's fsverity digest and compare it against the expected value from the tree metadata. This can use `composefs::fsverity::compute_verity()` for userspace digest computation, falling back from `measure_verity()` (which queries the kernel) when kernel fsverity is not available on the underlying filesystem.
+**Signature verification at mount time:**
 
-The daemon needs a mechanism to receive trusted certificates at startup for signature verification. The initial implementation should accept an explicit `--trust-cert /path/to/cert.pem` command-line flag. Later, automatic discovery from `$XDG_CONFIG_HOME/composefs/trust/*.pem` or the Linux user keyring (`@u` via `keyctl`) can be added — see the spec's "Unprivileged Verification" section for the full set of trust store options.
-
-**Signature verification in the FUSE path:**
-
-When a signature artifact is present, the daemon should verify PKCS#7 signatures against the trusted certificates before serving the mount. This is a one-time check at mount setup, not per-read: the tree structure (EROFS image) is validated once against its expected fsverity digest, and then individual objects are verified by digest at `open()` time. The `FsVeritySignatureVerifier` from `crates/composefs-oci/src/signing.rs` provides the verification API for PKCS#7 blobs over `fsverity_formatted_digest` structures.
+Signature verification (PKCS#7) operates at the image/mount level, not at the object level. When a signature artifact is present, composefs tooling can verify that the composefs digest was vouched for by a trusted signer before mounting. This is the same check regardless of whether mounting via EROFS or FUSE. The `FsVeritySignatureVerifier` from `crates/composefs-oci/src/signing.rs` provides the verification API for PKCS#7 blobs over `fsverity_formatted_digest` structures.
 
 **Trust certificate discovery:**
 
-The implementation should be phased. Start with explicit `--trust-cert` flags on the FUSE mount command (option 1). Next, add directory-based discovery from `$XDG_CONFIG_HOME/composefs/trust/*.pem` (option 2). Investigating the `keyutils` crate maturity for Linux user keyring integration (option 3) is lower priority but would provide the best system integration.
-
-**Open questions:**
-
-Should the FUSE daemon re-verify object digests on every `open()`, or cache verification results? Caching is faster but requires invalidation if objects change on disk. A reasonable starting point is to always verify on first `open()` and cache the result for the lifetime of the mount, since the repository contract is that objects are immutable once written.
-
-Should signature verification be mandatory or optional in the FUSE path? Mandatory is safer but breaks the current workflow where unsigned images can be mounted without any trust configuration. The likely answer is that signature verification is opt-in (triggered by providing `--trust-cert`), but when enabled, failures are hard errors.
-
-How does this interact with `insecure` mode? Currently insecure mode skips all verity checks. The FUSE path probably needs its own security mode enum — something like `FuseVerification::Full` (verify digests + signatures), `FuseVerification::DigestsOnly` (verify object digests but no signatures), and `FuseVerification::None` (current behavior, for development).
+The daemon needs a mechanism to receive trusted certificates for image-level signature verification. The implementation should be phased. Start with explicit `--trust-cert` flags on the FUSE mount command (option 1). Next, add directory-based discovery from `$XDG_CONFIG_HOME/composefs/trust/*.pem` (option 2). Investigating the `keyutils` crate maturity for Linux user keyring integration (option 3) is lower priority but would provide the best system integration. See the spec's "Unprivileged Verification" section for the full set of trust store options.
 
 ### Signature Artifact Construction (Implemented)
 
