@@ -129,6 +129,18 @@ For images sealed by the registry or vendor, the seal is computed during the bui
 
 For images sealed locally by the client, the client pulls an image that may be unsigned and computes the seal locally. The client stores the sealed config in its local repository. On boot or mount, the client can re-fetch the manifest from the network to verify freshness. Trust is placed in the network fetch (TLS) and local verification.
 
+### Kernel-Level vs Application-Level Signatures
+
+composefs supports two complementary signature mechanisms:
+
+**Application-level signatures** are stored in OCI signature artifacts (see "Signature Artifacts" above). The PKCS#7 blobs are verified in userspace by composefs tooling or policy engines. This is the primary model: it works with standard OCI registries, doesn't require kernel configuration, and integrates naturally with container signing workflows (cosign, notation, etc.).
+
+**Kernel-level signatures** use the Linux kernel's `.fs-verity` keyring. When a CA certificate is loaded into the keyring, the kernel requires a valid PKCS#7 signature when `FS_IOC_ENABLE_VERITY` is called — unsigned files cannot have verity enabled at all. This provides stronger enforcement (the kernel itself rejects unsigned content) but requires root access to configure the keyring and is independent of OCI semantics.
+
+Both models use the same PKCS#7 DER format over the same `fsverity_formatted_digest` structure, so signatures are interchangeable. An OCI signature artifact's PKCS#7 blobs can be passed to `FS_IOC_ENABLE_VERITY`, and kernel-level signatures can be stored in OCI artifacts.
+
+For the composefs repository object store, verity is always enabled without signatures (the fsverity digest itself is the trust anchor, verified against the expected value from the OCI config or signature artifact). Kernel-level signature enforcement is an optional, additional layer for environments that require it.
+
 ## Attack Mitigation
 
 ### Digest Mismatch
@@ -302,8 +314,10 @@ openssl smime -sign -binary -in /tmp/formatted_digest.bin \
 # Verify the signature:
 openssl smime -verify -binary -in signature.pkcs7.der \
     -content /tmp/formatted_digest.bin \
-    -certfile cert.pem -CAfile cert.pem -inform DER -noverify
+    -inform DER -CAfile cert.pem
 ```
+
+The `-CAfile` flag establishes the trust root for verification. The signing certificate (or its issuing CA) must be provided here. For self-signed certificates, the certificate itself serves as its own CA. **Do not use `-noverify`** — it disables certificate chain validation and defeats the purpose of signature verification.
 
 The critical flags are:
 

@@ -71,8 +71,7 @@ fi
 if openssl smime -verify -binary \
     -in "$TMPDIR/sig_256.der" \
     -content "$TMPDIR/formatted_digest_256.bin" \
-    -certfile "$TMPDIR/cert.pem" -CAfile "$TMPDIR/cert.pem" \
-    -inform DER -noverify >/dev/null 2>&1; then
+    -inform DER -CAfile "$TMPDIR/cert.pem" >/dev/null 2>&1; then
     pass "SHA-256 signature verifies"
 else
     fail "SHA-256 signature verification failed"
@@ -106,8 +105,7 @@ openssl smime -sign -binary \
 if openssl smime -verify -binary \
     -in "$TMPDIR/sig_512.der" \
     -content "$TMPDIR/formatted_digest_512.bin" \
-    -certfile "$TMPDIR/cert.pem" -CAfile "$TMPDIR/cert.pem" \
-    -inform DER -noverify >/dev/null 2>&1; then
+    -inform DER -CAfile "$TMPDIR/cert.pem" >/dev/null 2>&1; then
     pass "SHA-512 signature verifies"
 else
     fail "SHA-512 signature verification failed"
@@ -128,14 +126,30 @@ fi
 if openssl smime -verify -binary \
     -in "$TMPDIR/sig_256.der" \
     -content "$TMPDIR/formatted_digest_wrong.bin" \
-    -certfile "$TMPDIR/cert.pem" -CAfile "$TMPDIR/cert.pem" \
-    -inform DER -noverify >/dev/null 2>&1; then
+    -inform DER -CAfile "$TMPDIR/cert.pem" >/dev/null 2>&1; then
     fail "Wrong-digest verification should have failed but passed"
 else
     pass "Wrong-digest verification correctly rejected"
 fi
 
-# --- Test 4: Signature is valid DER-encoded PKCS#7 ---
+# --- Test 4: Wrong certificate must fail verification ---
+
+# Generate a second, unrelated keypair
+openssl req -x509 -newkey rsa:2048 \
+    -keyout "$TMPDIR/key2.pem" -out "$TMPDIR/cert2.pem" \
+    -days 1 -nodes -subj '/CN=composefs-wrong' 2>/dev/null
+
+# Verify sig_256 (signed with cert.pem) against cert2.pem — must fail
+if openssl smime -verify -binary \
+    -in "$TMPDIR/sig_256.der" \
+    -content "$TMPDIR/formatted_digest_256.bin" \
+    -inform DER -CAfile "$TMPDIR/cert2.pem" >/dev/null 2>&1; then
+    fail "Wrong-cert verification should have failed but passed"
+else
+    pass "Wrong-cert verification correctly rejected"
+fi
+
+# --- Test 5: Signature is valid DER-encoded PKCS#7 ---
 
 if openssl pkcs7 -inform DER -in "$TMPDIR/sig_256.der" -noout 2>/dev/null; then
     pass "Signature is valid DER PKCS#7"
