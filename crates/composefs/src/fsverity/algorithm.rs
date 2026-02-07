@@ -16,9 +16,9 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ComposeFsAlgorithm {
     /// Kernel algorithm identifier (FS_VERITY_HASH_ALG_SHA256=1, FS_VERITY_HASH_ALG_SHA512=2)
-    pub algorithm: u8,
+    algorithm: u8,
     /// Log2 of the block size (e.g. 12 for 4096-byte blocks)
-    pub log_block_size: u8,
+    log_block_size: u8,
 }
 
 /// SHA-256, 4096-byte blocks
@@ -40,6 +40,16 @@ pub const SHA256_16: ComposeFsAlgorithm = ComposeFsAlgorithm {
 };
 
 impl ComposeFsAlgorithm {
+    /// Kernel algorithm identifier (e.g. 1 for SHA-256, 2 for SHA-512).
+    pub const fn algorithm(&self) -> u8 {
+        self.algorithm
+    }
+
+    /// Log2 of the block size (e.g. 12 for 4096-byte blocks).
+    pub const fn log_block_size(&self) -> u8 {
+        self.log_block_size
+    }
+
     /// Block size in bytes.
     pub const fn block_size(&self) -> u32 {
         1u32 << self.log_block_size
@@ -69,7 +79,7 @@ impl ComposeFsAlgorithm {
     /// ```
     /// use composefs::fsverity::algorithm::ComposeFsAlgorithm;
     /// let alg = ComposeFsAlgorithm::parse("sha512-12").unwrap();
-    /// assert_eq!(alg.algorithm, 2);
+    /// assert_eq!(alg.algorithm(), 2);
     /// assert_eq!(alg.block_size(), 4096);
     /// ```
     pub fn parse(s: &str) -> Result<Self, ParseAlgorithmError> {
@@ -134,8 +144,8 @@ mod tests {
     #[test]
     fn parse_sha512_12() {
         let alg: ComposeFsAlgorithm = "sha512-12".parse().unwrap();
-        assert_eq!(alg.algorithm, 2);
-        assert_eq!(alg.log_block_size, 12);
+        assert_eq!(alg.algorithm(), 2);
+        assert_eq!(alg.log_block_size(), 12);
         assert_eq!(alg.block_size(), 4096);
         assert_eq!(alg.digest_size(), 64);
         assert_eq!(alg.hash_name(), "sha512");
@@ -145,8 +155,8 @@ mod tests {
     #[test]
     fn parse_sha256_12() {
         let alg: ComposeFsAlgorithm = "sha256-12".parse().unwrap();
-        assert_eq!(alg.algorithm, 1);
-        assert_eq!(alg.log_block_size, 12);
+        assert_eq!(alg.algorithm(), 1);
+        assert_eq!(alg.log_block_size(), 12);
         assert_eq!(alg.block_size(), 4096);
         assert_eq!(alg.digest_size(), 32);
         assert_eq!(alg.hash_name(), "sha256");
@@ -156,8 +166,8 @@ mod tests {
     #[test]
     fn parse_sha256_16() {
         let alg: ComposeFsAlgorithm = "sha256-16".parse().unwrap();
-        assert_eq!(alg.algorithm, 1);
-        assert_eq!(alg.log_block_size, 16);
+        assert_eq!(alg.algorithm(), 1);
+        assert_eq!(alg.log_block_size(), 16);
         assert_eq!(alg.block_size(), 65536);
     }
 

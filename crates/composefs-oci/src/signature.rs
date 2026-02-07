@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
+use composefs::fsverity::algorithm::ComposeFsAlgorithm;
 use composefs::fsverity::FsVerityHashValue;
 use containers_image_proxy::oci_spec::image::{
     Descriptor, DescriptorBuilder, Digest as OciDigest, ImageManifest, ImageManifestBuilder,
@@ -66,6 +67,20 @@ impl SignatureType {
     }
 }
 
+impl std::fmt::Display for SignatureType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SignatureType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| anyhow::anyhow!("unknown signature type: {s}"))
+    }
+}
+
 /// A single entry in a composefs signature artifact.
 ///
 /// Contains the composefs fsverity digest and optionally a PKCS#7 signature blob.
@@ -87,8 +102,8 @@ pub struct SignatureEntry {
 /// following the OCI artifacts guidance pattern.
 #[derive(Debug)]
 pub struct SignatureArtifactBuilder {
-    /// Algorithm identifier (e.g. "sha512-12").
-    algorithm: String,
+    /// Algorithm identifier (e.g. SHA512_12).
+    algorithm: ComposeFsAlgorithm,
     /// The subject descriptor (the source image manifest).
     subject: Descriptor,
     /// Signature entries in order: manifest, config, layers, merged.
@@ -112,11 +127,11 @@ const EMPTY_CONFIG_DIGEST: &str =
 impl SignatureArtifactBuilder {
     /// Create a new builder for a signature artifact.
     ///
-    /// `algorithm` is the composefs algorithm identifier (e.g. "sha512-12").
+    /// `algorithm` is the composefs algorithm identifier (e.g. `ComposeFsAlgorithm::SHA512_12`).
     /// `subject` is the descriptor of the source image manifest being signed.
-    pub fn new(algorithm: &str, subject: Descriptor) -> Self {
+    pub fn new(algorithm: ComposeFsAlgorithm, subject: Descriptor) -> Self {
         SignatureArtifactBuilder {
-            algorithm: algorithm.to_string(),
+            algorithm,
             subject,
             entries: Vec::new(),
         }
@@ -196,7 +211,7 @@ impl SignatureArtifactBuilder {
             .context("building config descriptor")?;
 
         let mut annotations = HashMap::new();
-        annotations.insert(ANN_ALGORITHM.to_string(), self.algorithm);
+        annotations.insert(ANN_ALGORITHM.to_string(), self.algorithm.to_string());
 
         let manifest = ImageManifestBuilder::default()
             .schema_version(2u32)
@@ -216,16 +231,19 @@ impl SignatureArtifactBuilder {
 /// Parse a composefs signature artifact manifest and extract digest entries.
 ///
 /// Returns entries in artifact layer order (manifest, config, layers, merged).
-pub fn parse_signature_artifact(manifest: &ImageManifest) -> Result<(String, Vec<SignatureEntry>)> {
+pub fn parse_signature_artifact(
+    manifest: &ImageManifest,
+) -> Result<(ComposeFsAlgorithm, Vec<SignatureEntry>)> {
     let annotations = manifest
         .annotations()
         .as_ref()
         .context("signature artifact missing annotations")?;
 
-    let algorithm = annotations
+    let algorithm: ComposeFsAlgorithm = annotations
         .get(ANN_ALGORITHM)
         .context("signature artifact missing composefs.algorithm annotation")?
-        .clone();
+        .parse()
+        .context("parsing composefs.algorithm annotation")?;
 
     let mut entries = Vec::with_capacity(manifest.layers().len());
 
@@ -284,7 +302,8 @@ mod tests {
     #[test]
     fn build_digest_only_artifact() {
         let subject = sample_subject();
-        let mut builder = SignatureArtifactBuilder::new("sha512-12", subject);
+        let mut builder =
+            SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
 
         builder.add_entry(SignatureEntry {
             sig_type: SignatureType::Layer,
@@ -321,7 +340,8 @@ mod tests {
     #[test]
     fn build_and_parse_roundtrip() {
         let subject = sample_subject();
-        let mut builder = SignatureArtifactBuilder::new("sha512-12", subject);
+        let mut builder =
+            SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
 
         builder.add_entry(SignatureEntry {
             sig_type: SignatureType::Manifest,
@@ -352,7 +372,7 @@ mod tests {
         let artifact = builder.build().unwrap();
         let (algorithm, entries) = parse_signature_artifact(&artifact.manifest).unwrap();
 
-        assert_eq!(algorithm, "sha512-12");
+        assert_eq!(algorithm, composefs::fsverity::algorithm::SHA512_12);
         assert_eq!(entries.len(), 5);
         assert_eq!(entries[0].sig_type, SignatureType::Manifest);
         assert_eq!(entries[0].digest, "aaaa");
