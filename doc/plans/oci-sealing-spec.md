@@ -141,6 +141,24 @@ Both models use the same PKCS#7 DER format over the same `fsverity_formatted_dig
 
 For the composefs repository object store, verity is always enabled without signatures (the fsverity digest itself is the trust anchor, verified against the expected value from the OCI config or signature artifact). Kernel-level signature enforcement is an optional, additional layer for environments that require it.
 
+### Unprivileged Verification
+
+In unprivileged (rootless) environments, neither kernel EROFS mounting nor kernel `.fs-verity` keyring access is available. Mounting EROFS requires `CAP_SYS_ADMIN` in the init user namespace, and modifying the `.fs-verity` keyring requires root. Composefs therefore falls back to FUSE-based mounting via `composefs-fuse`, and signature verification must happen entirely in userspace.
+
+In this model, the composefs FUSE daemon becomes the enforcement point. Before serving file content from the repository, the daemon must verify the EROFS image's fsverity digest against the expected value from the OCI config label or signature artifact, verify any PKCS#7 signatures present in a signature artifact against trusted certificates, and verify individual object digests at read time since kernel fsverity may not be available on the underlying filesystem.
+
+The trust anchor for unprivileged verification is the set of trusted certificates. Several options exist for storing these.
+
+**File-based trust store.** Certificates stored in a well-known directory (e.g. `~/.config/composefs/trust/`). This is simple but relies on filesystem-level protection of the directory.
+
+**Linux user keyring.** The `@u` (user) keyring is managed per-UID and accessible without privileges. The FUSE daemon could read trusted certificates from the user keyring via `keyctl`. This integrates with Linux's existing key management infrastructure but adds a `keyutils` dependency.
+
+**Per-repository trust.** Certificates stored in the composefs repository itself, pinned at repository creation time. This is the simplest model but limits flexibility — rotating or revoking trust requires recreating the repository.
+
+The tradeoff versus the privileged path is significant. Kernel-level fsverity provides transparent read-time integrity checking: the kernel itself rejects reads from tampered content, and the verification code is small and well-audited. The FUSE path must implement equivalent checking in userspace, which is slower and has a larger trusted computing base (the FUSE daemon is now in the trust boundary). However, for rootless containers this is the only option, and it provides the same *logical* security properties — an attacker who cannot modify the FUSE daemon binary cannot serve tampered content.
+
+Note the connection to the "Non-Root Mounting Helper" concept described in the implementation document: a privileged helper service that generates EROFS images and returns mount file descriptors is an alternative that avoids FUSE entirely. However, it requires a system service to be installed and configured, which may not be available in all environments. The FUSE + userspace verification path is fully self-contained and requires no privileged components.
+
 ## Attack Mitigation
 
 ### Digest Mismatch
