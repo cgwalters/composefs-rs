@@ -12,6 +12,7 @@
 
 pub mod image;
 pub mod oci_image;
+pub mod signature;
 pub mod skopeo;
 pub mod tar;
 
