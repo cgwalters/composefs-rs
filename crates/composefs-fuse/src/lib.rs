@@ -33,11 +33,22 @@ use rustix::{
 use composefs::{
     fsverity::FsVerityHashValue,
     mount::FsHandle,
-    repository::Repository,
+    repository::{Repository, VerifiedObject},
     tree::{Directory, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 const TTL: Duration = Duration::from_secs(1_000_000);
+
+/// Verification mode for the FUSE daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyMode {
+    /// Always verify object integrity (kernel verity → userspace fallback).
+    /// This is the default and recommended mode.
+    Always,
+    /// Trust the repository without verification.
+    /// Only appropriate when the repository is on a trusted, verity-enabled filesystem.
+    Trust,
+}
 
 #[derive(Debug, Clone)]
 enum InodeRef<'a, ObjectID: FsVerityHashValue> {
@@ -151,6 +162,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
 #[derive(Debug)]
 struct TreeFuse<'a, ObjectID: FsVerityHashValue> {
     repo: &'a Repository<ObjectID>,
+    verify: VerifyMode,
     inodes: HashMap<u64, InodeRef<'a, ObjectID>>,
     attrs: HashMap<u64, FileAttr>,
     handles: HashMap<u64, OpenHandle>,
@@ -341,13 +353,23 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
         };
 
         let handle = match &leaf.content {
-            LeafContent::Regular(RegularFile::External(id, ..)) => {
-                let Ok(fd) = self.repo.open_object(id) else {
-                    log::error!("open({ino}) open object failed");
-                    return reply.error(Errno::INVAL.raw_os_error());
-                };
-                OpenHandle::Fd(fd)
-            }
+            LeafContent::Regular(RegularFile::External(id, ..)) => match self.verify {
+                VerifyMode::Always => match self.repo.open_object_verified(id) {
+                    Ok(VerifiedObject::Fd(fd)) => OpenHandle::Fd(fd),
+                    Ok(VerifiedObject::Data(data)) => OpenHandle::Data(data),
+                    Err(err) => {
+                        log::error!("open({ino}) verification failed: {err:#}");
+                        return reply.error(Errno::IO.raw_os_error());
+                    }
+                },
+                VerifyMode::Trust => match self.repo.open_object(id) {
+                    Ok(fd) => OpenHandle::Fd(fd),
+                    Err(err) => {
+                        log::error!("open({ino}) open object failed: {err:#}");
+                        return reply.error(Errno::IO.raw_os_error());
+                    }
+                },
+            },
             LeafContent::Regular(RegularFile::Inline(data)) => OpenHandle::Data(data.clone()),
             _ => {
                 log::error!("open({ino}) non-regular file");
@@ -435,14 +457,16 @@ pub fn open_fuse() -> anyhow::Result<OwnedFd> {
 /// order for this to be useful, you'll also need to call serve_tree_fuse() to actually satisfy the
 /// requests for data.
 pub fn mount_fuse(dev_fuse: impl AsFd) -> anyhow::Result<OwnedFd> {
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
     let fusefs = FsHandle::open("fuse")?;
     fsconfig_set_flag(fusefs.as_fd(), "ro")?;
     fsconfig_set_flag(fusefs.as_fd(), "default_permissions")?;
     fsconfig_set_flag(fusefs.as_fd(), "allow_other")?;
     fsconfig_set_string(fusefs.as_fd(), "source", "composefs-fuse")?;
     fsconfig_set_string(fusefs.as_fd(), "rootmode", "040555")?;
-    fsconfig_set_string(fusefs.as_fd(), "user_id", "0")?;
-    fsconfig_set_string(fusefs.as_fd(), "group_id", "0")?;
+    fsconfig_set_string(fusefs.as_fd(), "user_id", format!("{uid}"))?;
+    fsconfig_set_string(fusefs.as_fd(), "group_id", format!("{gid}"))?;
     fsconfig_set_string(
         fusefs.as_fd(),
         "fd",
@@ -459,17 +483,36 @@ pub fn mount_fuse(dev_fuse: impl AsFd) -> anyhow::Result<OwnedFd> {
 /// Serves a FUSE filesystem exposing the content of `root`, backed by `repo`.
 ///
 /// You should have called mount_fuse() on the dev_fuse fd to establish a mount point.
+///
+/// The `verify` parameter controls whether objects are integrity-checked on open.
+/// `VerifyMode::Always` (recommended) verifies via kernel fsverity with a userspace fallback.
+/// `VerifyMode::Trust` skips verification, which is only safe when the repository lives on a
+/// trusted, verity-enabled filesystem.
 pub fn serve_tree_fuse<'a, ObjectID: FsVerityHashValue>(
     dev_fuse: OwnedFd,
     root: &'a Directory<ObjectID>,
     repo: &'a Repository<ObjectID>,
+    verify: VerifyMode,
 ) -> std::io::Result<()> {
     let fs = TreeFuse::<ObjectID> {
         repo,
+        verify,
         inodes: HashMap::from([(1, InodeRef::Directory(root, 1))]),
         attrs: Default::default(),
         handles: Default::default(),
         next_fh: 1,
     };
     Session::from_fd(fs, dev_fuse, SessionACL::All).run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_mode_default() {
+        assert_eq!(VerifyMode::Always, VerifyMode::Always);
+        assert_eq!(VerifyMode::Trust, VerifyMode::Trust);
+        assert_ne!(VerifyMode::Always, VerifyMode::Trust);
+    }
 }

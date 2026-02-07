@@ -144,6 +144,23 @@ fn ensure_dir_and_openat(dirfd: impl AsFd, filename: &str, flags: OFlags) -> Err
 /// A content-addressable repository for composefs objects.
 ///
 /// Stores content-addressed objects, splitstreams, and images with fsverity
+/// The result of a verified object open.
+///
+/// When kernel fsverity is available, the fd is returned directly — the kernel
+/// guarantees integrity for the lifetime of the fd. When kernel verity is
+/// unavailable, the file is read and verified in userspace, and the verified
+/// bytes are returned directly to avoid a TOCTOU gap.
+#[derive(Debug)]
+pub enum VerifiedObject {
+    /// Kernel-verified file descriptor. The kernel guarantees that all reads
+    /// from this fd will return the correct content (or EIO on corruption).
+    Fd(OwnedFd),
+    /// Userspace-verified data. The content has been read and its fsverity
+    /// digest was confirmed to match. Returned when kernel verity is unavailable,
+    /// to prevent TOCTOU attacks on non-verity filesystems.
+    Data(Box<[u8]>),
+}
+
 /// verification. Objects are stored by their fsverity digest, streams by SHA256
 /// content hash, and both support named references for persistence across
 /// garbage collection.
@@ -786,6 +803,65 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     #[context("Opening object {id:?}")]
     pub fn open_object(&self, id: &ObjectID) -> Result<OwnedFd> {
         self.open_with_verity(&Self::format_object_path(id), id)
+    }
+
+    /// Opens a repository object with guaranteed integrity verification.
+    ///
+    /// Unlike [`open_object`](Self::open_object), this method always verifies
+    /// the object's content against the expected digest, even on filesystems
+    /// without fsverity support and regardless of `insecure` mode.
+    ///
+    /// Verification strategy:
+    /// 1. Try kernel fsverity (`FS_IOC_MEASURE_VERITY`) — fast, O(1).
+    ///    Returns [`VerifiedObject::Fd`] — the kernel guarantees integrity for
+    ///    the lifetime of the fd.
+    /// 2. If kernel verity is unavailable, read the entire file and compute the
+    ///    fsverity digest in userspace — slower, O(file_size).
+    ///    Returns [`VerifiedObject::Data`] with the verified bytes. This avoids
+    ///    a TOCTOU gap: returning an fd would allow reads of potentially modified
+    ///    content after verification.
+    ///
+    /// This is the appropriate method for security-critical paths like the FUSE
+    /// daemon, where content integrity must be guaranteed regardless of the
+    /// underlying filesystem's capabilities.
+    #[context("Opening verified object {id:?}")]
+    pub fn open_object_verified(&self, id: &ObjectID) -> Result<VerifiedObject> {
+        let path = Self::format_object_path(id);
+        let fd = self
+            .openat(&path, OFlags::RDONLY)
+            .with_context(|| format!("Opening file '{path}' in repository"))?;
+
+        // Fast path: kernel fsverity verification
+        match ensure_verity_equal(&fd, id) {
+            Ok(()) => return Ok(VerifiedObject::Fd(fd)),
+            Err(CompareVerityError::Measure(
+                MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported,
+            )) => {
+                // Fall through to userspace verification
+            }
+            Err(other) => {
+                return Err(other).context("Verifying object fsverity digest")?;
+            }
+        }
+
+        // Slow path: read the file and compute the digest in userspace.
+        // We return the verified data directly rather than the fd to avoid a
+        // TOCTOU gap — on non-verity filesystems, the file could be modified
+        // between our verification and the caller's reads.
+        let mut file = File::from(fd);
+        let mut data = vec![];
+        file.read_to_end(&mut data)
+            .context("Reading object data for userspace verification")?;
+
+        let computed: ObjectID = compute_verity(&data);
+        ensure!(
+            &computed == id,
+            "userspace digest verification failed: expected {} but computed {}",
+            id.to_hex(),
+            computed.to_hex(),
+        );
+
+        Ok(VerifiedObject::Data(data.into_boxed_slice()))
     }
 
     /// Read the contents of an object into a Vec
@@ -2230,5 +2306,41 @@ mod tests {
         assert_eq!(result.images_pruned, 1);
         assert_eq!(result.streams_pruned, 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_open_object_verified() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let data = generate_test_data(4096, 0x42);
+        let id = repo.ensure_object(&data)?;
+        repo.sync()?;
+
+        let verified = repo.open_object_verified(&id)?;
+
+        // Read the contents back and confirm they match
+        let buf = match verified {
+            VerifiedObject::Fd(fd) => {
+                let mut buf = vec![];
+                File::from(fd).read_to_end(&mut buf)?;
+                buf
+            }
+            VerifiedObject::Data(data) => data.into_vec(),
+        };
+        assert_eq!(buf, data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_object_verified_detects_missing() {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo")).unwrap();
+
+        // Fabricate an ID that doesn't exist in the repository
+        let fake_id: Sha512HashValue = compute_verity(b"this object was never stored");
+        let result = repo.open_object_verified(&fake_id);
+        assert!(result.is_err(), "expected error for missing object");
     }
 }
