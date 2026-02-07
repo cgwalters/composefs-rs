@@ -59,9 +59,6 @@ Branch: `sealing-impl` (based on `oci-native-layer` / PR #216)
 - [ ] `cfsctl` CLI integration
   - `cfsctl sign` / `cfsctl verify` commands
   - `cfsctl seal --sign` to seal + create signature artifact in one step
-- [ ] Cosign/sigstore integration
-  - Verify cosign signatures on the signature artifact itself
-  - The artifact is "just another OCI manifest" so cosign can sign it
 
 ## Architecture Notes
 
