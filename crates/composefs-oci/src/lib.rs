@@ -13,6 +13,8 @@
 pub mod image;
 pub mod oci_image;
 pub mod signature;
+#[cfg(feature = "signing")]
+pub mod signing;
 pub mod skopeo;
 pub mod tar;
 
