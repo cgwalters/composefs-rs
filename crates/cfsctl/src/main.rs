@@ -551,17 +551,21 @@ where
                 )?;
 
                 if artifacts.is_empty() {
-                    println!("No signature artifacts found for {image}");
-                    return Ok(());
+                    anyhow::bail!("no signature artifacts found for {image}");
                 }
 
+                #[cfg(feature = "signing")]
                 if cert.is_some() {
-                    // Signature blob verification requires fetching individual
-                    // layer blobs from the artifact, which is not yet implemented.
-                    // For now we verify digests only.
-                    eprintln!(
-                        "Note: --cert provided but signature blob verification is not yet \
-                         implemented; verifying digests only"
+                    anyhow::bail!(
+                        "PKCS#7 signature blob verification via --cert is not yet implemented; \
+                         use digest-only verification (without --cert) for now"
+                    );
+                }
+                #[cfg(not(feature = "signing"))]
+                if cert.is_some() {
+                    anyhow::bail!(
+                        "PKCS#7 signature verification requires the 'signing' feature; \
+                         rebuild with --features signing"
                     );
                 }
 

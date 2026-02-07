@@ -36,10 +36,17 @@ use openssl::x509::X509;
 ///
 /// Holds a certificate and private key used to produce DER-encoded PKCS#7
 /// detached signatures over the `fsverity_formatted_digest` structure.
-#[derive(Debug)]
 pub struct FsVeritySigningKey {
     cert: X509,
     key: PKey<Private>,
+}
+
+impl std::fmt::Debug for FsVeritySigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsVeritySigningKey")
+            .field("cert_subject", &"<redacted>")
+            .finish()
+    }
 }
 
 impl FsVeritySigningKey {
@@ -48,8 +55,18 @@ impl FsVeritySigningKey {
     /// The certificate must correspond to the private key. The certificate
     /// is included in the PKCS#7 signature so that verifiers can extract it.
     pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<Self> {
-        let cert = X509::from_pem(cert_pem).context("failed to parse certificate PEM")?;
-        let key = PKey::private_key_from_pem(key_pem).context("failed to parse private key PEM")?;
+        let cert = X509::from_pem(cert_pem).context("parsing certificate PEM")?;
+        let key = PKey::private_key_from_pem(key_pem).context("parsing private key PEM")?;
+
+        // Verify cert and key correspond to each other
+        let cert_pubkey = cert
+            .public_key()
+            .context("extracting public key from certificate")?;
+        anyhow::ensure!(
+            cert_pubkey.public_eq(&key),
+            "certificate public key does not match the provided private key"
+        );
+
         Ok(Self { cert, key })
     }
 
@@ -67,6 +84,18 @@ impl FsVeritySigningKey {
     /// * `algorithm` - Kernel hash algorithm identifier (1=SHA-256, 2=SHA-512)
     /// * `digest` - Raw digest bytes
     pub fn sign_raw(&self, algorithm: u8, digest: &[u8]) -> Result<Vec<u8>> {
+        // Validate algorithm and digest length
+        let expected_size = match algorithm {
+            1 => 32, // SHA-256
+            2 => 64, // SHA-512
+            _ => anyhow::bail!("unsupported fsverity algorithm: {algorithm}"),
+        };
+        anyhow::ensure!(
+            digest.len() == expected_size,
+            "digest length mismatch: expected {expected_size} bytes for algorithm {algorithm}, got {}",
+            digest.len()
+        );
+
         let formatted =
             composefs::fsverity::formatted_digest::format_fsverity_digest_raw(algorithm, digest);
 
@@ -118,6 +147,18 @@ impl FsVeritySignatureVerifier {
     /// * `algorithm` - Kernel hash algorithm identifier (1=SHA-256, 2=SHA-512)
     /// * `digest` - Raw digest bytes
     pub fn verify_raw(&self, signature: &[u8], algorithm: u8, digest: &[u8]) -> Result<()> {
+        // Validate algorithm and digest length
+        let expected_size = match algorithm {
+            1 => 32, // SHA-256
+            2 => 64, // SHA-512
+            _ => anyhow::bail!("unsupported fsverity algorithm: {algorithm}"),
+        };
+        anyhow::ensure!(
+            digest.len() == expected_size,
+            "digest length mismatch: expected {expected_size} bytes for algorithm {algorithm}, got {}",
+            digest.len()
+        );
+
         let formatted =
             composefs::fsverity::formatted_digest::format_fsverity_digest_raw(algorithm, digest);
 
@@ -186,6 +227,16 @@ mod tests {
         let key_pem = key.private_key_to_pem_pkcs8().expect("key to PEM");
 
         (cert_pem, key_pem)
+    }
+
+    #[test]
+    fn test_rejects_mismatched_cert_key() {
+        let (cert_pem_a, _key_pem_a) = generate_test_keypair();
+        let (_cert_pem_b, key_pem_b) = generate_test_keypair();
+        let result = FsVeritySigningKey::from_pem(&cert_pem_a, &key_pem_b);
+        assert!(result.is_err());
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("does not match"), "unexpected error: {err}");
     }
 
     #[test]
