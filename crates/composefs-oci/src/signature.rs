@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use composefs::fsverity::algorithm::ComposeFsAlgorithm;
 use composefs::fsverity::FsVerityHashValue;
 use containers_image_proxy::oci_spec::image::{
@@ -65,6 +65,16 @@ impl SignatureType {
             _ => None,
         }
     }
+
+    /// Ordering rank for enforcing canonical entry order.
+    fn rank(self) -> u8 {
+        match self {
+            SignatureType::Manifest => 0,
+            SignatureType::Config => 1,
+            SignatureType::Layer => 2,
+            SignatureType::Merged => 3,
+        }
+    }
 }
 
 impl std::fmt::Display for SignatureType {
@@ -96,6 +106,17 @@ pub struct SignatureEntry {
     pub signature: Option<Vec<u8>>,
 }
 
+/// The result of parsing a composefs signature artifact manifest.
+#[derive(Debug)]
+pub struct ParsedSignatureArtifact {
+    /// The composefs algorithm used for fsverity digests.
+    pub algorithm: ComposeFsAlgorithm,
+    /// The subject descriptor (the image this artifact refers to).
+    pub subject: Descriptor,
+    /// Signature entries in artifact layer order.
+    pub entries: Vec<SignatureEntry>,
+}
+
 /// Builder for composefs signature artifacts.
 ///
 /// Collects signature entries and produces an OCI image manifest
@@ -108,6 +129,8 @@ pub struct SignatureArtifactBuilder {
     subject: Descriptor,
     /// Signature entries in order: manifest, config, layers, merged.
     entries: Vec<SignatureEntry>,
+    /// Rank of the last entry added, for ordering enforcement.
+    last_rank: Option<u8>,
 }
 
 /// The result of building a signature artifact.
@@ -134,6 +157,7 @@ impl SignatureArtifactBuilder {
             algorithm,
             subject,
             entries: Vec::new(),
+            last_rank: None,
         }
     }
 
@@ -141,30 +165,57 @@ impl SignatureArtifactBuilder {
     ///
     /// Entries MUST be added in the spec-defined order:
     /// manifest, config, layers (in manifest order), merged (in manifest order).
-    pub fn add_entry(&mut self, entry: SignatureEntry) {
+    /// Returns an error if the entry would violate this ordering, or if a
+    /// `Manifest` or `Config` entry is duplicated.
+    pub fn add_entry(&mut self, entry: SignatureEntry) -> Result<()> {
+        let rank = entry.sig_type.rank();
+
+        if let Some(last) = self.last_rank {
+            if rank < last {
+                bail!(
+                    "out-of-order entry: {} after {}",
+                    entry.sig_type,
+                    rank_to_name(last)
+                );
+            }
+            // Reject duplicate Manifest or Config (at most one each)
+            if rank == last && rank <= 1 {
+                bail!("duplicate {} entry", entry.sig_type);
+            }
+        }
+
+        self.last_rank = Some(rank);
         self.entries.push(entry);
+        Ok(())
     }
 
     /// Add digest-only entries for per-layer composefs digests.
     ///
     /// Convenience method that adds one `Layer` entry per digest.
-    pub fn add_layer_digests<ObjectID: FsVerityHashValue>(&mut self, digests: &[ObjectID]) {
+    pub fn add_layer_digests<ObjectID: FsVerityHashValue>(
+        &mut self,
+        digests: &[ObjectID],
+    ) -> Result<()> {
         for digest in digests {
-            self.entries.push(SignatureEntry {
+            self.add_entry(SignatureEntry {
                 sig_type: SignatureType::Layer,
                 digest: digest.to_hex(),
                 signature: None,
-            });
+            })?;
         }
+        Ok(())
     }
 
     /// Add a digest-only entry for a merged composefs digest.
-    pub fn add_merged_digest<ObjectID: FsVerityHashValue>(&mut self, digest: &ObjectID) {
-        self.entries.push(SignatureEntry {
+    pub fn add_merged_digest<ObjectID: FsVerityHashValue>(
+        &mut self,
+        digest: &ObjectID,
+    ) -> Result<()> {
+        self.add_entry(SignatureEntry {
             sig_type: SignatureType::Merged,
             digest: digest.to_hex(),
             signature: None,
-        });
+        })
     }
 
     /// Build the signature artifact.
@@ -230,10 +281,28 @@ impl SignatureArtifactBuilder {
 
 /// Parse a composefs signature artifact manifest and extract digest entries.
 ///
-/// Returns entries in artifact layer order (manifest, config, layers, merged).
-pub fn parse_signature_artifact(
-    manifest: &ImageManifest,
-) -> Result<(ComposeFsAlgorithm, Vec<SignatureEntry>)> {
+/// Validates artifact type, layer media types, digest format/length, entry
+/// ordering, and the presence of a subject descriptor.
+pub fn parse_signature_artifact(manifest: &ImageManifest) -> Result<ParsedSignatureArtifact> {
+    // Validate artifact type
+    match manifest.artifact_type() {
+        Some(MediaType::Other(s)) if s == ARTIFACT_TYPE => {}
+        other => bail!(
+            "wrong artifact type: expected {ARTIFACT_TYPE}, got {}",
+            match other {
+                Some(t) => format!("{t:?}"),
+                None => "none".to_string(),
+            }
+        ),
+    }
+
+    // A referrer artifact MUST have a subject
+    let subject = manifest
+        .subject()
+        .as_ref()
+        .context("signature artifact missing subject descriptor")?
+        .clone();
+
     let annotations = manifest
         .annotations()
         .as_ref()
@@ -245,9 +314,19 @@ pub fn parse_signature_artifact(
         .parse()
         .context("parsing composefs.algorithm annotation")?;
 
+    let expected_digest_bytes = algorithm.digest_size();
+
     let mut entries = Vec::with_capacity(manifest.layers().len());
 
     for layer in manifest.layers() {
+        // Validate layer media type
+        if *layer.media_type() != MediaType::Other(SIGNATURE_MEDIA_TYPE.to_string()) {
+            bail!(
+                "wrong layer media type: expected {SIGNATURE_MEDIA_TYPE}, got {:?}",
+                layer.media_type()
+            );
+        }
+
         let layer_annotations = layer
             .annotations()
             .as_ref()
@@ -265,6 +344,18 @@ pub fn parse_signature_artifact(
             .context("signature layer missing composefs.digest")?
             .clone();
 
+        // Validate digest: must be valid hex with correct length for the algorithm
+        let decoded = hex::decode(&digest)
+            .context(format!("invalid composefs.digest: not valid hex: {digest}"))?;
+        if decoded.len() != expected_digest_bytes {
+            bail!(
+                "invalid composefs.digest: expected {} bytes for {}, got {}",
+                expected_digest_bytes,
+                algorithm,
+                decoded.len()
+            );
+        }
+
         entries.push(SignatureEntry {
             sig_type,
             digest,
@@ -273,7 +364,66 @@ pub fn parse_signature_artifact(
         });
     }
 
-    Ok((algorithm, entries))
+    // Validate entry ordering and uniqueness
+    validate_entry_ordering(&entries)?;
+
+    Ok(ParsedSignatureArtifact {
+        algorithm,
+        subject,
+        entries,
+    })
+}
+
+/// Validate that entries follow the required ordering and uniqueness constraints.
+///
+/// Required order: Manifest (0..=1), Config (0..=1), Layer (0..), Merged (0..).
+fn validate_entry_ordering(entries: &[SignatureEntry]) -> Result<()> {
+    let mut prev_rank: Option<u8> = None;
+    let mut manifest_count = 0u32;
+    let mut config_count = 0u32;
+
+    for entry in entries {
+        let rank = entry.sig_type.rank();
+        if let Some(prev) = prev_rank {
+            if rank < prev {
+                bail!(
+                    "out-of-order entry: {} after {}",
+                    entry.sig_type,
+                    rank_to_name(prev)
+                );
+            }
+        }
+
+        match entry.sig_type {
+            SignatureType::Manifest => {
+                manifest_count += 1;
+                if manifest_count > 1 {
+                    bail!("duplicate manifest entry");
+                }
+            }
+            SignatureType::Config => {
+                config_count += 1;
+                if config_count > 1 {
+                    bail!("duplicate config entry");
+                }
+            }
+            _ => {}
+        }
+
+        prev_rank = Some(rank);
+    }
+    Ok(())
+}
+
+/// Map a rank value back to a type name for error messages.
+fn rank_to_name(rank: u8) -> &'static str {
+    match rank {
+        0 => "manifest",
+        1 => "config",
+        2 => "layer",
+        3 => "merged",
+        _ => "unknown",
+    }
 }
 
 fn sha256_digest(data: &[u8]) -> String {
@@ -284,6 +434,16 @@ fn sha256_digest(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Generate a realistic-length fake SHA-512 hex digest (128 hex chars = 64 bytes).
+    fn fake_sha512_digest(seed: u8) -> String {
+        std::iter::repeat(format!("{seed:02x}")).take(64).collect()
+    }
+
+    /// Generate a realistic-length fake SHA-256 hex digest (64 hex chars = 32 bytes).
+    fn fake_sha256_digest(seed: u8) -> String {
+        std::iter::repeat(format!("{seed:02x}")).take(32).collect()
+    }
 
     fn sample_subject() -> Descriptor {
         DescriptorBuilder::default()
@@ -305,15 +465,17 @@ mod tests {
         let mut builder =
             SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
 
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Layer,
-            digest: "abcd1234".to_string(),
-            signature: None,
-        });
+        let layer_digest = fake_sha512_digest(0xab);
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: layer_digest.clone(),
+                signature: None,
+            })
+            .unwrap();
 
         let artifact = builder.build().unwrap();
 
-        // Check manifest structure
         assert_eq!(artifact.manifest.schema_version(), 2);
         assert_eq!(
             artifact.manifest.artifact_type().as_ref().unwrap(),
@@ -322,17 +484,14 @@ mod tests {
         assert_eq!(artifact.manifest.layers().len(), 1);
         assert_eq!(artifact.blobs.len(), 1);
 
-        // Check subject
         let subject = artifact.manifest.subject().as_ref().unwrap();
         assert_eq!(subject.media_type(), &MediaType::ImageManifest);
 
-        // Check layer annotations
         let layer = &artifact.manifest.layers()[0];
         let ann = layer.annotations().as_ref().unwrap();
         assert_eq!(ann.get(ANN_SIGNATURE_TYPE).unwrap(), "layer");
-        assert_eq!(ann.get(ANN_DIGEST).unwrap(), "abcd1234");
+        assert_eq!(ann.get(ANN_DIGEST).unwrap(), &layer_digest);
 
-        // Check algorithm annotation on manifest
         let manifest_ann = artifact.manifest.annotations().as_ref().unwrap();
         assert_eq!(manifest_ann.get(ANN_ALGORITHM).unwrap(), "sha512-12");
     }
@@ -343,47 +502,66 @@ mod tests {
         let mut builder =
             SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
 
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Manifest,
-            digest: "aaaa".to_string(),
-            signature: None,
-        });
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Config,
-            digest: "bbbb".to_string(),
-            signature: None,
-        });
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Layer,
-            digest: "cccc".to_string(),
-            signature: None,
-        });
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Layer,
-            digest: "dddd".to_string(),
-            signature: None,
-        });
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Merged,
-            digest: "eeee".to_string(),
-            signature: None,
-        });
+        let d_manifest = fake_sha512_digest(0xaa);
+        let d_config = fake_sha512_digest(0xbb);
+        let d_layer0 = fake_sha512_digest(0xcc);
+        let d_layer1 = fake_sha512_digest(0xdd);
+        let d_merged = fake_sha512_digest(0xee);
+
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Manifest,
+                digest: d_manifest.clone(),
+                signature: None,
+            })
+            .unwrap();
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Config,
+                digest: d_config.clone(),
+                signature: None,
+            })
+            .unwrap();
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: d_layer0.clone(),
+                signature: None,
+            })
+            .unwrap();
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: d_layer1.clone(),
+                signature: None,
+            })
+            .unwrap();
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Merged,
+                digest: d_merged.clone(),
+                signature: None,
+            })
+            .unwrap();
 
         let artifact = builder.build().unwrap();
-        let (algorithm, entries) = parse_signature_artifact(&artifact.manifest).unwrap();
+        let parsed = parse_signature_artifact(&artifact.manifest).unwrap();
 
-        assert_eq!(algorithm, composefs::fsverity::algorithm::SHA512_12);
-        assert_eq!(entries.len(), 5);
-        assert_eq!(entries[0].sig_type, SignatureType::Manifest);
-        assert_eq!(entries[0].digest, "aaaa");
-        assert_eq!(entries[1].sig_type, SignatureType::Config);
-        assert_eq!(entries[1].digest, "bbbb");
-        assert_eq!(entries[2].sig_type, SignatureType::Layer);
-        assert_eq!(entries[2].digest, "cccc");
-        assert_eq!(entries[3].sig_type, SignatureType::Layer);
-        assert_eq!(entries[3].digest, "dddd");
-        assert_eq!(entries[4].sig_type, SignatureType::Merged);
-        assert_eq!(entries[4].digest, "eeee");
+        assert_eq!(parsed.algorithm, composefs::fsverity::algorithm::SHA512_12);
+        assert_eq!(parsed.entries.len(), 5);
+        assert_eq!(parsed.entries[0].sig_type, SignatureType::Manifest);
+        assert_eq!(parsed.entries[0].digest, d_manifest);
+        assert_eq!(parsed.entries[1].sig_type, SignatureType::Config);
+        assert_eq!(parsed.entries[1].digest, d_config);
+        assert_eq!(parsed.entries[2].sig_type, SignatureType::Layer);
+        assert_eq!(parsed.entries[2].digest, d_layer0);
+        assert_eq!(parsed.entries[3].sig_type, SignatureType::Layer);
+        assert_eq!(parsed.entries[3].digest, d_layer1);
+        assert_eq!(parsed.entries[4].sig_type, SignatureType::Merged);
+        assert_eq!(parsed.entries[4].digest, d_merged);
+
+        // Subject should be preserved
+        assert_eq!(parsed.subject.media_type(), &MediaType::ImageManifest);
     }
 
     #[test]
@@ -392,43 +570,47 @@ mod tests {
         let mut builder =
             SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
 
-        // A digest-only entry (no signature blob)
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Manifest,
-            digest: "manifest_digest".to_string(),
-            signature: None,
-        });
+        let d_manifest = fake_sha512_digest(0x11);
+        let d_layer = fake_sha512_digest(0x22);
+        let d_merged = fake_sha512_digest(0x33);
 
-        // An entry with a fake PKCS#7 blob
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Manifest,
+                digest: d_manifest.clone(),
+                signature: None,
+            })
+            .unwrap();
+
         let fake_sig = vec![0x30, 0x82, 0x01, 0x00, 0xAB, 0xCD, 0xEF];
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Layer,
-            digest: "layer_digest".to_string(),
-            signature: Some(fake_sig.clone()),
-        });
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: d_layer.clone(),
+                signature: Some(fake_sig.clone()),
+            })
+            .unwrap();
 
-        // Another digest-only entry
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Merged,
-            digest: "merged_digest".to_string(),
-            signature: None,
-        });
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Merged,
+                digest: d_merged.clone(),
+                signature: None,
+            })
+            .unwrap();
 
         let artifact = builder.build().unwrap();
 
-        // Blob storage: entry 0 is empty, entry 1 is the signature, entry 2 is empty
         assert_eq!(artifact.blobs.len(), 3);
         assert!(artifact.blobs[0].is_empty());
         assert_eq!(artifact.blobs[1], fake_sig);
         assert!(artifact.blobs[2].is_empty());
 
-        // Layer descriptors should match blob sizes
         let layers = artifact.manifest.layers();
         assert_eq!(layers[0].size(), 0);
         assert_eq!(layers[1].size(), fake_sig.len() as u64);
         assert_eq!(layers[2].size(), 0);
 
-        // All layers use the signature media type
         for layer in layers {
             assert_eq!(
                 layer.media_type(),
@@ -436,11 +618,10 @@ mod tests {
             );
         }
 
-        // Roundtrip through parse should preserve the digest values
-        let (_, entries) = parse_signature_artifact(&artifact.manifest).unwrap();
-        assert_eq!(entries[0].digest, "manifest_digest");
-        assert_eq!(entries[1].digest, "layer_digest");
-        assert_eq!(entries[2].digest, "merged_digest");
+        let parsed = parse_signature_artifact(&artifact.manifest).unwrap();
+        assert_eq!(parsed.entries[0].digest, d_manifest);
+        assert_eq!(parsed.entries[1].digest, d_layer);
+        assert_eq!(parsed.entries[2].digest, d_merged);
     }
 
     #[test]
@@ -448,14 +629,15 @@ mod tests {
         let subject = sample_subject();
         let mut builder =
             SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Layer,
-            digest: "abcd".to_string(),
-            signature: None,
-        });
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: fake_sha512_digest(0x44),
+                signature: None,
+            })
+            .unwrap();
         let artifact = builder.build().unwrap();
 
-        // Remove manifest-level annotations
         let mut manifest = artifact.manifest.clone();
         manifest.set_annotations(None);
 
@@ -472,19 +654,27 @@ mod tests {
         let subject = sample_subject();
         let mut builder =
             SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Layer,
-            digest: "abcd".to_string(),
-            signature: None,
-        });
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: fake_sha512_digest(0x55),
+                signature: None,
+            })
+            .unwrap();
         let artifact = builder.build().unwrap();
 
-        // Tamper with the layer annotation to inject an unknown signature type
         let mut manifest = artifact.manifest.clone();
         let layer = &mut manifest.layers_mut()[0];
         let mut ann = layer.annotations().clone().unwrap();
         ann.insert(ANN_SIGNATURE_TYPE.to_string(), "unknown_type".to_string());
         layer.set_annotations(Some(ann));
+
+        let err = parse_signature_artifact(&manifest).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown signature type"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -492,41 +682,46 @@ mod tests {
         let subject = sample_subject();
         let mut builder =
             SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Manifest,
-            digest: "aaaa".to_string(),
-            signature: None,
-        });
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Layer,
-            digest: "bbbb".to_string(),
-            signature: Some(vec![1, 2, 3]),
-        });
+
+        let d_manifest = fake_sha512_digest(0x66);
+        let d_layer = fake_sha512_digest(0x77);
+
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Manifest,
+                digest: d_manifest.clone(),
+                signature: None,
+            })
+            .unwrap();
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: d_layer.clone(),
+                signature: Some(vec![1, 2, 3]),
+            })
+            .unwrap();
 
         let artifact = builder.build().unwrap();
 
-        // Serialize via oci-spec's own to_string (JSON)
         let json = artifact
             .manifest
             .to_string()
             .expect("manifest serialization");
 
-        // Parse back
-        let parsed = ImageManifest::from_reader(json.as_bytes()).expect("manifest deserialization");
+        let parsed_manifest =
+            ImageManifest::from_reader(json.as_bytes()).expect("manifest deserialization");
 
-        // The parsed manifest should produce the same entries
-        let (algorithm, entries) = parse_signature_artifact(&parsed).unwrap();
-        assert_eq!(algorithm, composefs::fsverity::algorithm::SHA512_12);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].sig_type, SignatureType::Manifest);
-        assert_eq!(entries[0].digest, "aaaa");
-        assert_eq!(entries[1].sig_type, SignatureType::Layer);
-        assert_eq!(entries[1].digest, "bbbb");
+        let parsed = parse_signature_artifact(&parsed_manifest).unwrap();
+        assert_eq!(parsed.algorithm, composefs::fsverity::algorithm::SHA512_12);
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].sig_type, SignatureType::Manifest);
+        assert_eq!(parsed.entries[0].digest, d_manifest);
+        assert_eq!(parsed.entries[1].sig_type, SignatureType::Layer);
+        assert_eq!(parsed.entries[1].digest, d_layer);
     }
 
     #[test]
     fn test_empty_config_digest_correctness() {
-        // EMPTY_CONFIG_DIGEST should be the sha256 of "{}" (2 bytes)
         let computed = sha256_digest(b"{}");
         assert_eq!(
             computed, EMPTY_CONFIG_DIGEST,
@@ -542,26 +737,239 @@ mod tests {
 
         let mut builder =
             SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
-        builder.add_entry(SignatureEntry {
-            sig_type: SignatureType::Layer,
-            digest: "abcd".to_string(),
-            signature: None,
-        });
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: fake_sha512_digest(0x88),
+                signature: None,
+            })
+            .unwrap();
 
         let artifact = builder.build().unwrap();
 
-        // Serialize to JSON and parse back to ensure subject survives a roundtrip
         let json = artifact
             .manifest
             .to_string()
             .expect("manifest serialization");
-        let parsed = ImageManifest::from_reader(json.as_bytes()).expect("manifest deserialization");
+        let parsed_manifest =
+            ImageManifest::from_reader(json.as_bytes()).expect("manifest deserialization");
 
-        let roundtripped_subject = parsed
-            .subject()
-            .as_ref()
-            .expect("subject should be present after roundtrip");
-        assert_eq!(roundtripped_subject.digest(), &expected_digest);
-        assert_eq!(roundtripped_subject.media_type(), &expected_media_type);
+        let parsed = parse_signature_artifact(&parsed_manifest).unwrap();
+        assert_eq!(parsed.subject.digest(), &expected_digest);
+        assert_eq!(parsed.subject.media_type(), &expected_media_type);
+    }
+
+    // --- Validation tests ---
+
+    #[test]
+    fn test_parse_rejects_wrong_artifact_type() {
+        let subject = sample_subject();
+        let mut builder =
+            SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: fake_sha512_digest(0xab),
+                signature: None,
+            })
+            .unwrap();
+        let artifact = builder.build().unwrap();
+
+        let mut manifest = artifact.manifest.clone();
+        manifest.set_artifact_type(Some(MediaType::Other("wrong/type".to_string())));
+
+        let err = parse_signature_artifact(&manifest).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("wrong artifact type"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_bad_digest_hex() {
+        let subject = sample_subject();
+        let mut builder =
+            SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: fake_sha512_digest(0xab),
+                signature: None,
+            })
+            .unwrap();
+        let artifact = builder.build().unwrap();
+
+        let mut manifest = artifact.manifest.clone();
+        let layer = &mut manifest.layers_mut()[0];
+        let mut ann = layer.annotations().clone().unwrap();
+        ann.insert(ANN_DIGEST.to_string(), "not-valid-hex!@#$".to_string());
+        layer.set_annotations(Some(ann));
+
+        let err = parse_signature_artifact(&manifest).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not valid hex"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_parse_rejects_wrong_digest_length() {
+        let subject = sample_subject();
+        let mut builder =
+            SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: fake_sha512_digest(0xab),
+                signature: None,
+            })
+            .unwrap();
+        let artifact = builder.build().unwrap();
+
+        // Use a 32-byte (SHA-256 length) hex for a SHA-512 artifact
+        let mut manifest = artifact.manifest.clone();
+        let layer = &mut manifest.layers_mut()[0];
+        let mut ann = layer.annotations().clone().unwrap();
+        ann.insert(ANN_DIGEST.to_string(), fake_sha256_digest(0xcd));
+        layer.set_annotations(Some(ann));
+
+        let err = parse_signature_artifact(&manifest).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expected 64 bytes") && msg.contains("got 32"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_out_of_order() {
+        let subject = sample_subject();
+        let mut builder =
+            SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: fake_sha512_digest(0x01),
+                signature: None,
+            })
+            .unwrap();
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Merged,
+                digest: fake_sha512_digest(0x02),
+                signature: None,
+            })
+            .unwrap();
+        let artifact = builder.build().unwrap();
+
+        // Swap the layer annotations so merged comes before layer
+        let mut manifest = artifact.manifest.clone();
+        let layers = manifest.layers_mut();
+        let ann0 = layers[0].annotations().clone().unwrap();
+        let ann1 = layers[1].annotations().clone().unwrap();
+        layers[0].set_annotations(Some(ann1));
+        layers[1].set_annotations(Some(ann0));
+
+        let err = parse_signature_artifact(&manifest).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("out-of-order"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_parse_requires_subject() {
+        let subject = sample_subject();
+        let mut builder =
+            SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: fake_sha512_digest(0xab),
+                signature: None,
+            })
+            .unwrap();
+        let artifact = builder.build().unwrap();
+
+        let mut manifest = artifact.manifest.clone();
+        manifest.set_subject(None);
+
+        let err = parse_signature_artifact(&manifest).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing subject"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_builder_rejects_out_of_order() {
+        let subject = sample_subject();
+        let mut builder =
+            SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
+
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: fake_sha512_digest(0x01),
+                signature: None,
+            })
+            .unwrap();
+
+        let err = builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Manifest,
+                digest: fake_sha512_digest(0x02),
+                signature: None,
+            })
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("out-of-order"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_builder_rejects_duplicate_manifest() {
+        let subject = sample_subject();
+        let mut builder =
+            SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
+
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Manifest,
+                digest: fake_sha512_digest(0x01),
+                signature: None,
+            })
+            .unwrap();
+
+        let err = builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Manifest,
+                digest: fake_sha512_digest(0x02),
+                signature: None,
+            })
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("duplicate"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_parse_rejects_wrong_layer_media_type() {
+        let subject = sample_subject();
+        let mut builder =
+            SignatureArtifactBuilder::new(composefs::fsverity::algorithm::SHA512_12, subject);
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: fake_sha512_digest(0xab),
+                signature: None,
+            })
+            .unwrap();
+        let artifact = builder.build().unwrap();
+
+        // Tamper via JSON roundtrip to change the layer media type
+        let json = artifact.manifest.to_string().unwrap();
+        let tampered = json.replace(SIGNATURE_MEDIA_TYPE, "application/octet-stream");
+        let manifest = ImageManifest::from_reader(tampered.as_bytes()).unwrap();
+
+        let err = parse_signature_artifact(&manifest).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("wrong layer media type"),
+            "unexpected error: {msg}"
+        );
     }
 }

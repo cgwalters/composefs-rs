@@ -95,6 +95,11 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
 ///
 /// The final merged digest (the digest of the complete flattened filesystem with
 /// `transform_for_oci()` applied) can be obtained from `seal()` or `create_filesystem()`.
+///
+/// **Security note**: When `config_verity` is `None`, layer content is not verified against
+/// the config's diff_ids. Callers MUST provide a trusted `config_verity` when computing
+/// digests that will be used in signature artifacts. Without verity, a compromised repository
+/// could cause digests to be computed over substituted layer content.
 #[context("Computing per-layer digests")]
 pub fn compute_per_layer_digests<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
