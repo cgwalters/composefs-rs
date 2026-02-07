@@ -181,7 +181,7 @@ mod test {
         fsverity::Sha256HashValue,
         tree::{LeafContent, RegularFile, Stat},
     };
-    use std::{cell::RefCell, collections::BTreeMap, io::BufRead, path::PathBuf};
+    use std::{cell::RefCell, collections::BTreeMap, io::BufRead, io::Read, path::PathBuf};
 
     use super::*;
 
@@ -223,6 +223,157 @@ mod test {
 
         similar_asserts::assert_eq!(actual, expected);
         Ok(())
+    }
+
+    use std::sync::Arc;
+
+    use composefs::repository::Repository;
+    use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+    use rustix::fs::CWD;
+    use sha2::{Digest, Sha256};
+
+    use composefs::test::tempdir;
+
+    fn append_tar_data(builder: &mut ::tar::Builder<Vec<u8>>, name: &str, size: usize) {
+        let mut header = ::tar::Header::new_ustar();
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mode(0o700);
+        header.set_entry_type(::tar::EntryType::Regular);
+        header.set_size(size as u64);
+        builder
+            .append_data(&mut header, name, std::io::repeat(0u8).take(size as u64))
+            .unwrap();
+    }
+
+    fn append_tar_dir(builder: &mut ::tar::Builder<Vec<u8>>, name: &str) {
+        let mut header = ::tar::Header::new_ustar();
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mode(0o755);
+        header.set_entry_type(::tar::EntryType::Directory);
+        header.set_size(0);
+        builder
+            .append_data(&mut header, name, std::io::empty())
+            .unwrap();
+    }
+
+    /// Build a simple tar layer and compute its sha256 diff_id.
+    fn build_layer() -> (Vec<u8>, String) {
+        let mut builder = ::tar::Builder::new(vec![]);
+        append_tar_data(&mut builder, "file0", 0);
+        append_tar_data(&mut builder, "file4096", 4096);
+        let data = builder.into_inner().unwrap();
+
+        let mut ctx = Sha256::new();
+        ctx.update(&data);
+        let diff_id = format!("sha256:{}", hex::encode(ctx.finalize()));
+        (data, diff_id)
+    }
+
+    /// Build a tar layer that includes a /usr directory (needed for transform_for_oci).
+    fn build_layer_with_usr() -> (Vec<u8>, String) {
+        let mut builder = ::tar::Builder::new(vec![]);
+        append_tar_dir(&mut builder, "usr");
+        append_tar_data(&mut builder, "file0", 0);
+        append_tar_data(&mut builder, "file4096", 4096);
+        let data = builder.into_inner().unwrap();
+
+        let mut ctx = Sha256::new();
+        ctx.update(&data);
+        let diff_id = format!("sha256:{}", hex::encode(ctx.finalize()));
+        (data, diff_id)
+    }
+
+    #[test]
+    fn test_compute_per_layer_digests() {
+        let repo_dir = tempdir();
+        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+
+        // Build and import a layer
+        let (layer_data, diff_id) = build_layer();
+        let layer_verity =
+            crate::import_layer(&repo, &diff_id, None, &mut layer_data.as_slice()).unwrap();
+
+        // Create an OCI config referencing this layer
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec![diff_id.clone()])
+            .build()
+            .unwrap();
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .build()
+            .unwrap();
+
+        let mut refs = std::collections::HashMap::new();
+        refs.insert(Box::from(diff_id.as_str()), layer_verity);
+
+        let (config_digest, config_verity) = crate::write_config(&repo, &config, refs).unwrap();
+
+        // Compute per-layer digests (with verity)
+        let digests =
+            compute_per_layer_digests(&repo, &config_digest, Some(&config_verity)).unwrap();
+        assert_eq!(digests.len(), 1, "expected exactly 1 per-layer digest");
+
+        // Determinism: calling again should produce the same result
+        let digests2 =
+            compute_per_layer_digests(&repo, &config_digest, Some(&config_verity)).unwrap();
+        assert_eq!(
+            digests, digests2,
+            "per-layer digests should be deterministic"
+        );
+
+        // Also works without verity (slower path that verifies content hashes)
+        let digests3 = compute_per_layer_digests(&repo, &config_digest, None).unwrap();
+        assert_eq!(
+            digests, digests3,
+            "verity and non-verity paths should agree"
+        );
+    }
+
+    #[test]
+    fn test_per_layer_digest_differs_from_merged() {
+        let repo_dir = tempdir();
+        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+
+        // Use a layer with /usr so that transform_for_oci() succeeds
+        let (layer_data, diff_id) = build_layer_with_usr();
+        let layer_verity =
+            crate::import_layer(&repo, &diff_id, None, &mut layer_data.as_slice()).unwrap();
+
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec![diff_id.clone()])
+            .build()
+            .unwrap();
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .build()
+            .unwrap();
+
+        let mut refs = std::collections::HashMap::new();
+        refs.insert(Box::from(diff_id.as_str()), layer_verity);
+
+        let (config_digest, config_verity) = crate::write_config(&repo, &config, refs).unwrap();
+
+        let per_layer =
+            compute_per_layer_digests(&repo, &config_digest, Some(&config_verity)).unwrap();
+        assert_eq!(per_layer.len(), 1);
+
+        let merged_fs = create_filesystem(&repo, &config_digest, Some(&config_verity)).unwrap();
+        let merged_digest = merged_fs.compute_image_id();
+
+        // The merged filesystem applies transform_for_oci() which copies /usr metadata
+        // to the root, so the digests should differ.
+        assert_ne!(
+            per_layer[0], merged_digest,
+            "per-layer and merged digests should differ because of transform_for_oci"
+        );
     }
 
     #[test]
