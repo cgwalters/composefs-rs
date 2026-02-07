@@ -157,6 +157,101 @@ Boot verification is designed to be rooted in extant hardware mechanisms such as
 
 These mechanisms work together in a complete workflow where a sealed OCI image can be pulled from a registry, verified through OCI sealing, and then used to build a boot artifact with the composefs digest embedded for boot verification. However, each mechanism operates independently with its own trust anchor and threat model.
 
+## Signature Artifacts
+
+In addition to embedding the composefs digest in the image config, a separate OCI artifact can carry composefs fsverity digests (and optionally PKCS#7 signatures) for each component of the image. This follows the [OCI Referrers](https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers) pattern: the artifact references the source image manifest via the `subject` field, making it discoverable through the registry `/referrers` API — similar to how cosign attaches signatures.
+
+### Artifact Structure
+
+The signature artifact is an OCI image manifest with:
+
+- `artifactType` set to `application/vnd.composefs.signature.v1`
+- An empty config descriptor with media type `application/vnd.oci.empty.v1+json` (the 2-byte `{}` blob), per OCI artifacts guidance
+- A `subject` descriptor pointing to the source image manifest, enabling referrer discovery
+- A manifest-level `composefs.algorithm` annotation encoding the fsverity algorithm as `{hash}-{blocksizebits}` (e.g. `sha512-12` for SHA-512 with 4096-byte blocks, `sha256-12` for SHA-256 with 4096-byte blocks)
+
+Each layer in the artifact represents one signed component. Layers use media type `application/vnd.composefs.signature.v1+pkcs7`. The layer blob is either a PKCS#7 DER signature or empty (zero bytes) for digest-only entries where the digest is recorded but no cryptographic signature is attached.
+
+### Layer Annotations
+
+Each layer descriptor carries two annotations:
+
+- `composefs.signature.type` — what this entry covers. Values are:
+  - `manifest` — the OCI manifest JSON
+  - `config` — the OCI config JSON
+  - `layer` — an individual composefs layer EROFS
+  - `merged` — the merged (flattened) composefs filesystem
+- `composefs.digest` — the fsverity digest as a hex string
+
+### Layer Ordering
+
+Layers MUST appear in the following order: manifest, config, layers (in manifest order), merged. Multiple `layer` entries appear in the same order as the layers in the source image manifest. Multiple `merged` entries may appear if rolling merges are recorded.
+
+### Example Artifact Manifest
+
+```json
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "artifactType": "application/vnd.composefs.signature.v1",
+  "config": {
+    "mediaType": "application/vnd.oci.empty.v1+json",
+    "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "size": 2
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.composefs.signature.v1+pkcs7",
+      "digest": "sha256:...",
+      "size": 0,
+      "annotations": {
+        "composefs.signature.type": "manifest",
+        "composefs.digest": "abcdef..."
+      }
+    },
+    {
+      "mediaType": "application/vnd.composefs.signature.v1+pkcs7",
+      "digest": "sha256:...",
+      "size": 0,
+      "annotations": {
+        "composefs.signature.type": "config",
+        "composefs.digest": "123456..."
+      }
+    },
+    {
+      "mediaType": "application/vnd.composefs.signature.v1+pkcs7",
+      "digest": "sha256:...",
+      "size": 0,
+      "annotations": {
+        "composefs.signature.type": "layer",
+        "composefs.digest": "aabbcc..."
+      }
+    },
+    {
+      "mediaType": "application/vnd.composefs.signature.v1+pkcs7",
+      "digest": "sha256:...",
+      "size": 0,
+      "annotations": {
+        "composefs.signature.type": "merged",
+        "composefs.digest": "ddeeff..."
+      }
+    }
+  ],
+  "subject": {
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "digest": "sha256:5b0bcabd1ed22e9fb1310cf6c2dec7cdef19f0ad69efa1f392e94a4333501270",
+    "size": 7682
+  },
+  "annotations": {
+    "composefs.algorithm": "sha512-12"
+  }
+}
+```
+
+### Relationship to Config Labels
+
+The signature artifact and the config label (`containers.composefs.fsverity`) serve complementary purposes. The config label embeds the merged digest directly in the image identity, making it available without fetching additional artifacts. The signature artifact provides per-component digests (manifest, config, individual layers, merged) and supports attaching PKCS#7 signatures without modifying the source image. Both mechanisms can be used together.
+
 ## Future Directions
 
 ### Dumpfile Digest as Canonical Identifier

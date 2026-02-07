@@ -88,9 +88,9 @@ Phase 4 will implement push support for sealed images, preserve annotations thro
 
 Deliverables include bidirectional registry support, a registry compatibility matrix, and integration tests with real registries.
 
-### Phase 5: Advanced Features (Future)
+### Phase 5: Advanced Features (Partially Implemented)
 
-Future work includes dumpfile digest support, eager/lazy verification modes, zstd:chunked integration, the three-digest model, and signature integration.
+Signature artifact construction and parsing is implemented (see `crates/composefs-oci/src/signature.rs`). Remaining future work includes dumpfile digest support, eager/lazy verification modes, zstd:chunked integration, the three-digest model, and cosign/sigstore integration.
 
 ## API Design Considerations
 
@@ -190,7 +190,11 @@ Integration with zstd:chunked requires reading and writing TOC metadata with fsv
 
 A separate composefs-mount-helper service would accept dumpfiles from unprivileged users, generate EROFS images, validate fsverity, and return mount file descriptors. This requires privileged service implementation with careful input validation on the dumpfile format.
 
-### Signature Integration
+### Signature Artifact Construction (Implemented)
+
+The `composefs-oci` crate includes a `signature` module (`crates/composefs-oci/src/signature.rs`) that builds and parses OCI signature artifacts following the OCI Referrers pattern. The `SignatureArtifactBuilder` constructs an OCI image manifest with artifact type `application/vnd.composefs.signature.v1`, an empty config per OCI artifacts guidance, a `subject` descriptor pointing to the source image, and layers carrying per-component fsverity digests (and optional PKCS#7 signatures). The `parse_signature_artifact()` function provides the inverse operation. See the [Signature Artifacts](oci-sealing-spec.md#signature-artifacts) section of the spec for the full schema.
+
+### Cosign/Sigstore Integration
 
 Integrating with cosign or sigstore requires fetching and verifying signatures during pull, associating signatures with sealed images in the repository, and potentially storing signature references in seal metadata. The signature verification should happen before seal verification in the trust chain.
 
@@ -200,6 +204,7 @@ See [oci-sealing-spec.md](oci-sealing-spec.md) for the generic specification and
 
 **Implementation references**:
 - `crates/composefs-oci/src/image.rs` - OCI image operations including seal()
+- `crates/composefs-oci/src/signature.rs` - Signature artifact construction and parsing
 - `crates/composefs/src/repository.rs` - Repository management
 - `crates/composefs/src/fsverity/` - Fsverity computation and verification
 - `crates/composefs/src/splitstream.rs` - Split stream format
