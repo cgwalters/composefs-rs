@@ -43,7 +43,8 @@ use anyhow::{ensure, Context, Result};
 use containers_image_proxy::oci_spec::image::{
     Descriptor, ImageConfiguration, ImageManifest, MediaType,
 };
-use rustix::fs::{readlinkat, unlinkat, AtFlags};
+use rustix::fs::{openat, readlinkat, unlinkat, AtFlags, Dir, Mode, OFlags};
+use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
@@ -675,6 +676,102 @@ pub fn list_referrers<ObjectID: FsVerityHashValue>(
     }
 
     Ok(referrers)
+}
+
+/// Removes referrer index entries whose subject manifest no longer exists.
+///
+/// When a subject image is untagged and garbage collected, its referrer
+/// artifacts become orphaned — their referrer symlinks under
+/// `streams/refs/oci-referrers/{subject_digest}/` still act as GC roots,
+/// preventing the artifact manifests from being collected.
+///
+/// Call this **before** running GC to ensure orphaned referrer artifacts
+/// are also eligible for collection. The typical workflow is:
+///
+/// ```text
+/// cleanup_dangling_referrers(&repo)?;
+/// repo.gc(&[])?;
+/// ```
+///
+/// Returns the number of referrer entries removed.
+pub fn cleanup_dangling_referrers<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+) -> Result<u64> {
+    let referrers_path = format!("streams/refs/{REFERRER_REF_PREFIX}");
+
+    // Open the oci-referrers directory; if it doesn't exist, there's nothing to do
+    let referrers_dir = match openat(
+        repo.repo_fd(),
+        &*referrers_path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(0),
+        Err(e) => return Err(e).context("Opening oci-referrers directory")?,
+    };
+
+    let mut removed = 0u64;
+
+    // Collect subject directory names first to avoid borrowing issues
+    let mut subject_dirs = Vec::new();
+    for item in Dir::read_from(&referrers_dir).context("Reading oci-referrers directory")? {
+        let entry = item.context("Reading oci-referrers entry")?;
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        if let Ok(s) = std::str::from_utf8(name.to_bytes()) {
+            subject_dirs.push(s.to_string());
+        }
+    }
+
+    for encoded_subject in &subject_dirs {
+        let subject_digest = decode_tag(encoded_subject);
+
+        // Check if the subject manifest still exists in the repository
+        if has_manifest(repo, &subject_digest)?.is_some() {
+            continue;
+        }
+
+        // Subject is gone — remove all referrer entries in this directory
+        let subject_dir_fd = match openat(
+            &referrers_dir,
+            encoded_subject.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => continue,
+            Err(e) => {
+                return Err(e)
+                    .context(format!("Opening referrer subject dir {encoded_subject}"))?
+            }
+        };
+
+        for item in Dir::read_from(&subject_dir_fd)
+            .context("Reading referrer subject directory")?
+        {
+            let entry = item.context("Reading referrer entry")?;
+            let name = entry.file_name();
+            if name == c"." || name == c".." {
+                continue;
+            }
+            unlinkat(&subject_dir_fd, name, AtFlags::empty())
+                .with_context(|| format!("Removing referrer entry {name:?}"))?;
+            removed += 1;
+        }
+
+        // Remove the now-empty subject directory
+        unlinkat(
+            &referrers_dir,
+            encoded_subject.as_str(),
+            AtFlags::REMOVEDIR,
+        )
+        .with_context(|| format!("Removing empty referrer subject dir {encoded_subject}"))?;
+    }
+
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -2002,5 +2099,231 @@ mod test {
                 "Missing artifact {expected} in referrers"
             );
         }
+    }
+
+    /// Helper to create a minimal OCI artifact manifest in the repository.
+    ///
+    /// Returns (manifest_digest, manifest_verity).
+    fn create_test_artifact(
+        repo: &Arc<Repository<Sha256HashValue>>,
+        blob_data: &[u8],
+    ) -> (String, Sha256HashValue) {
+        let (blob_digest, blob_verity) = write_blob(repo, blob_data).unwrap();
+
+        let empty_config = b"{}";
+        let config_digest = hash(empty_config);
+
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        config_stream.write_inline(empty_config);
+        let config_verity = repo
+            .write_stream(
+                config_stream,
+                &crate::config_identifier(&config_digest),
+                None,
+            )
+            .unwrap();
+
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::EmptyJSON)
+            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .size(empty_config.len() as u64)
+            .build()
+            .unwrap();
+
+        let layer_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::Other("application/octet-stream".to_string()))
+            .digest(OciDigest::from_str(&blob_digest).unwrap())
+            .size(blob_data.len() as u64)
+            .build()
+            .unwrap();
+
+        let manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor)
+            .layers(vec![layer_descriptor])
+            .build()
+            .unwrap();
+
+        let mut layer_verities = HashMap::new();
+        layer_verities.insert(blob_digest.into_boxed_str(), blob_verity);
+
+        let manifest_json = manifest.to_string().unwrap();
+        let manifest_digest = hash(manifest_json.as_bytes());
+
+        let (_stored_digest, manifest_verity) = write_manifest(
+            repo,
+            &manifest,
+            &manifest_digest,
+            &config_verity,
+            &layer_verities,
+            None,
+        )
+        .unwrap();
+
+        (manifest_digest, manifest_verity)
+    }
+
+    /// Test that GC collects referrer artifacts when their subject is untagged.
+    ///
+    /// Referrer symlinks under `streams/refs/oci-referrers/` act as GC roots,
+    /// so orphaned referrer entries must be cleaned up before GC to allow
+    /// the artifact manifests and their objects to be collected.
+    #[test]
+    fn test_gc_cleans_referrer_artifacts() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // 1. Create a subject image with a tag
+        let (subject_digest, _subject_verity, _) =
+            create_test_image(repo, Some("subject:v1"), "amd64");
+
+        // 2. Create an artifact referencing the subject
+        let (artifact_digest, _artifact_verity) =
+            create_test_artifact(repo, b"fake-signature-data");
+
+        // 3. Register the referrer relationship
+        add_referrer(repo, &subject_digest, &artifact_digest).unwrap();
+
+        // 4. Verify the referrer is discoverable
+        let referrers = list_referrers(repo, &subject_digest).unwrap();
+        assert_eq!(referrers.len(), 1);
+        assert_eq!(referrers[0].0, artifact_digest);
+
+        // Verify GC preserves everything while subject is tagged
+        let gc = repo.gc(&[]).unwrap();
+        assert_eq!(gc.objects_removed, 0, "nothing should be collected yet");
+
+        // Artifact should still be accessible
+        assert!(
+            has_manifest(repo, &artifact_digest).unwrap().is_some(),
+            "artifact manifest should exist"
+        );
+
+        // 5. Untag the subject image
+        untag_image(repo, "subject:v1").unwrap();
+
+        // 6. First GC pass: collects the subject's objects and cleans up
+        //    its broken stream symlink. The artifact survives because the
+        //    referrer symlink still acts as a GC root.
+        let gc1 = repo.gc(&[]).unwrap();
+        assert!(gc1.objects_removed > 0, "should collect subject objects");
+        assert!(
+            has_manifest(repo, &subject_digest).unwrap().is_none(),
+            "subject manifest should be gone after first GC"
+        );
+        // Artifact is still alive — rooted by referrer symlink
+        assert!(
+            has_manifest(repo, &artifact_digest).unwrap().is_some(),
+            "artifact should survive first GC (referrer symlink roots it)"
+        );
+
+        // 7. Clean up dangling referrers (subject no longer exists)
+        let cleaned = cleanup_dangling_referrers(repo).unwrap();
+        assert_eq!(cleaned, 1, "should remove 1 dangling referrer entry");
+
+        // 8. Second GC pass: now collects the artifact (no longer rooted)
+        let gc2 = repo.gc(&[]).unwrap();
+        assert!(
+            gc2.objects_removed > 0,
+            "should collect artifact objects"
+        );
+
+        // 9. Verify the artifact manifest is gone
+        assert!(
+            has_manifest(repo, &artifact_digest).unwrap().is_none(),
+            "artifact manifest should be collected"
+        );
+
+        // 10. Verify list_referrers returns empty
+        let referrers = list_referrers(repo, &subject_digest).unwrap();
+        assert!(
+            referrers.is_empty(),
+            "no referrers should remain after GC"
+        );
+
+        // Also verify the subject manifest is gone
+        assert!(
+            has_manifest(repo, &subject_digest).unwrap().is_none(),
+            "subject manifest should be collected"
+        );
+    }
+
+    /// Test that cleanup_dangling_referrers preserves referrers for tagged subjects.
+    #[test]
+    fn test_cleanup_referrers_preserves_tagged_subjects() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // Create a tagged subject
+        let (subject_digest, _, _) = create_test_image(repo, Some("subject:v1"), "amd64");
+
+        // Create an artifact and register it as a referrer
+        let (artifact_digest, _) = create_test_artifact(repo, b"sig-data");
+        add_referrer(repo, &subject_digest, &artifact_digest).unwrap();
+
+        // Cleanup should not remove anything — subject is still tagged
+        let cleaned = cleanup_dangling_referrers(repo).unwrap();
+        assert_eq!(cleaned, 0, "should not remove referrers for tagged subject");
+
+        // Referrer should still be discoverable
+        let referrers = list_referrers(repo, &subject_digest).unwrap();
+        assert_eq!(referrers.len(), 1);
+    }
+
+    /// Test that cleanup handles multiple subjects, only removing dangling ones.
+    #[test]
+    fn test_cleanup_referrers_mixed_subjects() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // Create two subjects
+        let (subject1_digest, _, _) =
+            create_test_image(repo, Some("subject1:v1"), "amd64");
+        let (subject2_digest, _, _) =
+            create_test_image(repo, Some("subject2:v1"), "arm64");
+
+        // Create artifacts for both
+        let (artifact1_digest, _) = create_test_artifact(repo, b"sig-for-subject1");
+        let (artifact2_digest, _) = create_test_artifact(repo, b"sig-for-subject2");
+
+        add_referrer(repo, &subject1_digest, &artifact1_digest).unwrap();
+        add_referrer(repo, &subject2_digest, &artifact2_digest).unwrap();
+
+        // Untag only subject1
+        untag_image(repo, "subject1:v1").unwrap();
+
+        // First GC pass to actually remove subject1's manifest stream
+        // (cleanup_dangling_referrers checks has_manifest, which checks the
+        // stream symlink; GC removes the broken symlink after object deletion)
+        repo.gc(&[]).unwrap();
+
+        // Now cleanup should only remove referrers for subject1
+        let cleaned = cleanup_dangling_referrers(repo).unwrap();
+        assert_eq!(cleaned, 1, "should remove 1 referrer for untagged subject");
+
+        // Run GC again to collect the now-unrooted artifact1
+        let gc = repo.gc(&[]).unwrap();
+        assert!(gc.objects_removed > 0);
+
+        // subject2's referrer should still exist
+        let referrers2 = list_referrers(repo, &subject2_digest).unwrap();
+        assert_eq!(referrers2.len(), 1);
+        assert_eq!(referrers2[0].0, artifact2_digest);
+
+        // subject1's artifact should be gone
+        assert!(has_manifest(repo, &artifact1_digest).unwrap().is_none());
+        // subject2's artifact should still exist
+        assert!(has_manifest(repo, &artifact2_digest).unwrap().is_some());
+    }
+
+    /// Test that cleanup_dangling_referrers is a no-op on an empty repository.
+    #[test]
+    fn test_cleanup_referrers_empty_repo() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let cleaned = cleanup_dangling_referrers(repo).unwrap();
+        assert_eq!(cleaned, 0);
     }
 }
