@@ -43,6 +43,11 @@ pub struct App {
     #[clap(long)]
     insecure: bool,
 
+    /// Run in unprivileged mode (use FUSE mounting instead of kernel EROFS).
+    /// Automatically enabled when running as non-root without CAP_SYS_ADMIN.
+    #[clap(long)]
+    unprivileged: bool,
+
     #[clap(subcommand)]
     cmd: Command,
 }
@@ -251,6 +256,13 @@ where
     })?;
 
     repo.set_insecure(args.insecure);
+
+    // Auto-detect privilege level if not explicitly set
+    if args.unprivileged {
+        repo.set_privileged(false);
+    } else {
+        repo.set_privileged(rustix::process::getuid().is_root());
+    }
 
     Ok(repo)
 }
