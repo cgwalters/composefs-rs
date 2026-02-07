@@ -33,22 +33,11 @@ use rustix::{
 use composefs::{
     fsverity::FsVerityHashValue,
     mount::FsHandle,
-    repository::{Repository, VerifiedObject},
+    repository::Repository,
     tree::{Directory, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
 
 const TTL: Duration = Duration::from_secs(1_000_000);
-
-/// Verification mode for the FUSE daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerifyMode {
-    /// Always verify object integrity (kernel verity → userspace fallback).
-    /// This is the default and recommended mode.
-    Always,
-    /// Trust the repository without verification.
-    /// Only appropriate when the repository is on a trusted, verity-enabled filesystem.
-    Trust,
-}
 
 #[derive(Debug, Clone)]
 enum InodeRef<'a, ObjectID: FsVerityHashValue> {
@@ -162,7 +151,6 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
 #[derive(Debug)]
 struct TreeFuse<'a, ObjectID: FsVerityHashValue> {
     repo: &'a Repository<ObjectID>,
-    verify: VerifyMode,
     inodes: HashMap<u64, InodeRef<'a, ObjectID>>,
     attrs: HashMap<u64, FileAttr>,
     handles: HashMap<u64, OpenHandle>,
@@ -353,23 +341,15 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
         };
 
         let handle = match &leaf.content {
-            LeafContent::Regular(RegularFile::External(id, ..)) => match self.verify {
-                VerifyMode::Always => match self.repo.open_object_verified(id) {
-                    Ok(VerifiedObject::Fd(fd)) => OpenHandle::Fd(fd),
-                    Ok(VerifiedObject::Data(data)) => OpenHandle::Data(data),
-                    Err(err) => {
-                        log::error!("open({ino}) verification failed: {err:#}");
-                        return reply.error(Errno::IO.raw_os_error());
-                    }
-                },
-                VerifyMode::Trust => match self.repo.open_object(id) {
+            LeafContent::Regular(RegularFile::External(id, ..)) => {
+                match self.repo.open_object(id) {
                     Ok(fd) => OpenHandle::Fd(fd),
                     Err(err) => {
                         log::error!("open({ino}) open object failed: {err:#}");
                         return reply.error(Errno::IO.raw_os_error());
                     }
-                },
-            },
+                }
+            }
             LeafContent::Regular(RegularFile::Inline(data)) => OpenHandle::Data(data.clone()),
             _ => {
                 log::error!("open({ino}) non-regular file");
@@ -484,35 +464,21 @@ pub fn mount_fuse(dev_fuse: impl AsFd) -> anyhow::Result<OwnedFd> {
 ///
 /// You should have called mount_fuse() on the dev_fuse fd to establish a mount point.
 ///
-/// The `verify` parameter controls whether objects are integrity-checked on open.
-/// `VerifyMode::Always` (recommended) verifies via kernel fsverity with a userspace fallback.
-/// `VerifyMode::Trust` skips verification, which is only safe when the repository lives on a
-/// trusted, verity-enabled filesystem.
+/// Object integrity follows the repository's configuration: when verity is enabled
+/// on the repository's filesystem, `open_object()` verifies digests via the kernel.
+/// When the repository is in `insecure` mode (no verity support), objects are served
+/// without integrity verification — matching the kernel EROFS path's behavior.
 pub fn serve_tree_fuse<'a, ObjectID: FsVerityHashValue>(
     dev_fuse: OwnedFd,
     root: &'a Directory<ObjectID>,
     repo: &'a Repository<ObjectID>,
-    verify: VerifyMode,
 ) -> std::io::Result<()> {
     let fs = TreeFuse::<ObjectID> {
         repo,
-        verify,
         inodes: HashMap::from([(1, InodeRef::Directory(root, 1))]),
         attrs: Default::default(),
         handles: Default::default(),
         next_fh: 1,
     };
     Session::from_fd(fs, dev_fuse, SessionACL::All).run()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_verify_mode_default() {
-        assert_eq!(VerifyMode::Always, VerifyMode::Always);
-        assert_eq!(VerifyMode::Trust, VerifyMode::Trust);
-        assert_ne!(VerifyMode::Always, VerifyMode::Trust);
-    }
 }
