@@ -248,6 +248,82 @@ Layers MUST appear in the following order: manifest, config, layers (in manifest
 }
 ```
 
+## External Signing with openssl CLI
+
+The PKCS#7 signatures used in composefs signature artifacts can be produced with the `openssl` command-line tool, without linking against libssl. This is useful for CI pipelines, air-gapped signing environments, or any context where shelling out to `openssl` is simpler than integrating a library.
+
+### Constructing the `fsverity_formatted_digest`
+
+The PKCS#7 signature must cover a specific byte structure called `fsverity_formatted_digest` (defined in the kernel at `include/uapi/linux/fsverity.h`). This is the same structure that the kernel reconstructs internally when verifying a signature.
+
+**For SHA-256** (32-byte digest, total 44 bytes):
+
+```
+Bytes 0-7:   46 53 56 65 72 69 74 79  ("FSVerity" ASCII magic)
+Bytes 8-9:   01 00                    (algorithm 1 = SHA-256, little-endian u16)
+Bytes 10-11: 20 00                    (digest size 32 = 0x20, little-endian u16)
+Bytes 12-43: <32 bytes of raw digest>
+```
+
+**For SHA-512** (64-byte digest, total 76 bytes):
+
+```
+Bytes 0-7:   46 53 56 65 72 69 74 79  ("FSVerity" ASCII magic)
+Bytes 8-9:   02 00                    (algorithm 2 = SHA-512, little-endian u16)
+Bytes 10-11: 40 00                    (digest size 64 = 0x40, little-endian u16)
+Bytes 12-75: <64 bytes of raw digest>
+```
+
+### Shell commands for the complete workflow
+
+```bash
+# Generate a test key pair (one-time setup)
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+    -days 365 -nodes -subj '/CN=composefs-test'
+
+# Given a hex fsverity digest (e.g. from cfsctl or fsverity-utils):
+DIGEST_HEX="a3b2c1d4..."
+
+# Construct the formatted_digest structure (SHA-256 example):
+python3 -c "
+import sys, struct
+magic = b'FSVerity'
+alg = struct.pack('<H', 1)      # SHA-256
+size = struct.pack('<H', 32)
+digest = bytes.fromhex('$DIGEST_HEX')
+sys.stdout.buffer.write(magic + alg + size + digest)
+" > /tmp/formatted_digest.bin
+
+# Sign with openssl smime (PKCS#7 detached, DER output, no attributes):
+openssl smime -sign -binary -in /tmp/formatted_digest.bin \
+    -signer cert.pem -inkey key.pem -outform DER -noattr \
+    -out signature.pkcs7.der
+
+# Verify the signature:
+openssl smime -verify -binary -in signature.pkcs7.der \
+    -content /tmp/formatted_digest.bin \
+    -certfile cert.pem -CAfile cert.pem -inform DER -noverify
+```
+
+The critical flags are:
+
+- `-binary`: treat input as raw bytes, no MIME canonicalization
+- `-noattr`: omit authenticated attributes (the kernel expects a bare signature)
+- `-outform DER`: produce DER encoding, not PEM — the kernel expects DER
+
+### Using `fsverity-utils` instead
+
+```bash
+# fsverity-utils can compute the digest and sign in one step:
+fsverity sign myfile signature.der --key=key.pem --cert=cert.pem
+```
+
+This produces an identical PKCS#7 DER blob that can be used in composefs signature artifacts.
+
+### Interoperability
+
+Signatures produced by the `openssl` CLI, `fsverity-utils`, and composefs-rs's signing library are all interchangeable — they produce standard PKCS#7 DER blobs over the same `fsverity_formatted_digest` structure.
+
 ### Relationship to Config Labels
 
 The signature artifact and the config label (`containers.composefs.fsverity`) serve complementary purposes. The config label embeds the merged digest directly in the image identity, making it available without fetching additional artifacts. The signature artifact provides per-component digests (manifest, config, individual layers, merged) and supports attaching PKCS#7 signatures without modifying the source image. Both mechanisms can be used together.
