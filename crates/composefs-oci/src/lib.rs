@@ -29,11 +29,11 @@ use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::get_entry;
 
 // Re-export key types for convenience
-pub use oci_image::{
-    list_images, list_refs, resolve_ref, tag_image, untag_image, ImageInfo, OciImage,
-    OCI_REF_PREFIX,
-};
 pub use image::compute_per_layer_digests;
+pub use oci_image::{
+    add_referrer, list_images, list_referrers, list_refs, resolve_ref, tag_image, untag_image,
+    ImageInfo, OciImage, OCI_REF_PREFIX,
+};
 pub use skopeo::{pull_image, PullResult};
 
 type ContentAndVerity<ObjectID> = (String, ObjectID);

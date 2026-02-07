@@ -604,6 +604,79 @@ pub fn open_blob<ObjectID: FsVerityHashValue>(
     Ok(data)
 }
 
+// =============================================================================
+// Referrer Index (for OCI Artifacts with subject field)
+// =============================================================================
+
+/// Prefix for referrer index references.
+const REFERRER_REF_PREFIX: &str = "oci-referrers/";
+
+/// Records a referrer relationship: an artifact references a subject image.
+///
+/// Creates a symlink at `streams/refs/oci-referrers/{subject_digest}/{artifact_digest}`
+/// pointing to the artifact's manifest stream. This enables discovery of all artifacts
+/// that reference a given image (e.g. finding all signature artifacts for an image).
+///
+/// Both digests should be in the `sha256:...` format used by OCI.
+pub fn add_referrer<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    subject_digest: &str,
+    artifact_manifest_digest: &str,
+) -> Result<()> {
+    let ref_name = format!(
+        "{REFERRER_REF_PREFIX}{}/{}",
+        encode_tag(subject_digest),
+        encode_tag(artifact_manifest_digest)
+    );
+    let manifest_id = manifest_identifier(artifact_manifest_digest);
+    repo.name_stream(&manifest_id, &ref_name)
+}
+
+/// Lists all artifacts that reference the given subject manifest digest.
+///
+/// Returns `(artifact_manifest_digest, artifact_manifest_verity)` pairs for
+/// each artifact that declared the subject as its referrer. The digests are
+/// in `sha256:...` format.
+pub fn list_referrers<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    subject_digest: &str,
+) -> Result<Vec<(String, ObjectID)>> {
+    let prefix = format!("{REFERRER_REF_PREFIX}{}", encode_tag(subject_digest));
+
+    let mut referrers = Vec::new();
+
+    for (name, target) in repo.list_stream_refs(&prefix)? {
+        // The name is the encoded artifact manifest digest
+        let artifact_digest = decode_tag(&name);
+
+        // Extract verity from the symlink target — it points to
+        // a manifest stream path like "../../oci-manifest-sha256:abc..."
+        let manifest_part = target.rsplit('/').next().unwrap_or(&target);
+        if let Some(digest) = manifest_part.strip_prefix("oci-manifest-") {
+            // Verify consistency: the ref name should match the target
+            if digest != artifact_digest {
+                eprintln!(
+                    "Warning: referrer ref name ({artifact_digest}) does not match \
+                     target manifest ({digest}), skipping"
+                );
+                continue;
+            }
+        }
+
+        // Look up the verity for this manifest
+        match repo.has_stream(&manifest_identifier(&artifact_digest))? {
+            Some(verity) => referrers.push((artifact_digest, verity)),
+            None => {
+                eprintln!(
+                    "Warning: referrer index points to missing manifest {artifact_digest}, skipping"
+                );
+            }
+        }
+    }
+
+    Ok(referrers)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1765,5 +1838,169 @@ mod test {
         assert!(has_manifest(repo, &untagged_digest).unwrap().is_none());
         // Tagged still exists
         assert!(has_manifest(repo, &tagged_digest).unwrap().is_some());
+    }
+
+    /// Test referrer index: store an artifact, add a referrer entry,
+    /// then discover it via list_referrers.
+    #[test]
+    fn test_referrer_index_roundtrip() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // Create a "subject" image that will be referenced
+        let (subject_digest, _subject_verity, _) =
+            create_test_image(repo, Some("subject:v1"), "amd64");
+
+        // Create a simple artifact manifest that references the subject
+        let blob_data = b"signature-blob";
+        let (blob_digest, blob_verity) = write_blob(repo, blob_data).unwrap();
+
+        let empty_config = b"{}";
+        let config_digest = hash(empty_config);
+
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        config_stream.write_inline(empty_config);
+        let config_verity = repo
+            .write_stream(
+                config_stream,
+                &crate::config_identifier(&config_digest),
+                None,
+            )
+            .unwrap();
+
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::EmptyJSON)
+            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .size(empty_config.len() as u64)
+            .build()
+            .unwrap();
+
+        let layer_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::Other("application/octet-stream".to_string()))
+            .digest(OciDigest::from_str(&blob_digest).unwrap())
+            .size(blob_data.len() as u64)
+            .build()
+            .unwrap();
+
+        let manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor)
+            .layers(vec![layer_descriptor])
+            .build()
+            .unwrap();
+
+        let mut layer_verities = HashMap::new();
+        layer_verities.insert(blob_digest.into_boxed_str(), blob_verity);
+
+        let manifest_json = manifest.to_string().unwrap();
+        let manifest_digest = hash(manifest_json.as_bytes());
+
+        let (_stored_digest, _manifest_verity) = write_manifest(
+            repo,
+            &manifest,
+            &manifest_digest,
+            &config_verity,
+            &layer_verities,
+            None,
+        )
+        .unwrap();
+
+        // Before adding the referrer, list should be empty
+        let referrers = list_referrers(repo, &subject_digest).unwrap();
+        assert!(referrers.is_empty());
+
+        // Add the referrer index entry
+        add_referrer(repo, &subject_digest, &manifest_digest).unwrap();
+
+        // Now list_referrers should find it
+        let referrers = list_referrers(repo, &subject_digest).unwrap();
+        assert_eq!(referrers.len(), 1);
+        assert_eq!(referrers[0].0, manifest_digest);
+
+        // Querying a different subject should return empty
+        let other = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let referrers = list_referrers(repo, other).unwrap();
+        assert!(referrers.is_empty());
+    }
+
+    /// Test referrer index with multiple artifacts referencing the same subject.
+    #[test]
+    fn test_referrer_index_multiple() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (subject_digest, _, _) = create_test_image(repo, Some("subject:v1"), "amd64");
+
+        let empty_config = b"{}";
+        let config_digest = hash(empty_config);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        config_stream.write_inline(empty_config);
+        let config_verity = repo
+            .write_stream(
+                config_stream,
+                &crate::config_identifier(&config_digest),
+                None,
+            )
+            .unwrap();
+
+        // Create two artifact manifests referencing the same subject
+        let mut artifact_digests = Vec::new();
+        for i in 0..2u8 {
+            let blob_data = format!("artifact-blob-{i}").into_bytes();
+            let (blob_digest, blob_verity) = write_blob(repo, &blob_data).unwrap();
+
+            let config_descriptor = DescriptorBuilder::default()
+                .media_type(MediaType::EmptyJSON)
+                .digest(OciDigest::from_str(&config_digest).unwrap())
+                .size(empty_config.len() as u64)
+                .build()
+                .unwrap();
+
+            let layer_descriptor = DescriptorBuilder::default()
+                .media_type(MediaType::Other("application/octet-stream".to_string()))
+                .digest(OciDigest::from_str(&blob_digest).unwrap())
+                .size(blob_data.len() as u64)
+                .build()
+                .unwrap();
+
+            let manifest = ImageManifestBuilder::default()
+                .schema_version(2u32)
+                .media_type(MediaType::ImageManifest)
+                .config(config_descriptor)
+                .layers(vec![layer_descriptor])
+                .build()
+                .unwrap();
+
+            let mut layer_verities = HashMap::new();
+            layer_verities.insert(blob_digest.into_boxed_str(), blob_verity);
+
+            let manifest_json = manifest.to_string().unwrap();
+            let manifest_digest = hash(manifest_json.as_bytes());
+
+            write_manifest(
+                repo,
+                &manifest,
+                &manifest_digest,
+                &config_verity,
+                &layer_verities,
+                None,
+            )
+            .unwrap();
+
+            add_referrer(repo, &subject_digest, &manifest_digest).unwrap();
+            artifact_digests.push(manifest_digest);
+        }
+
+        let referrers = list_referrers(repo, &subject_digest).unwrap();
+        assert_eq!(referrers.len(), 2);
+
+        let found_digests: Vec<&str> = referrers.iter().map(|(d, _)| d.as_str()).collect();
+        for expected in &artifact_digests {
+            assert!(
+                found_digests.contains(&expected.as_str()),
+                "Missing artifact {expected} in referrers"
+            );
+        }
     }
 }

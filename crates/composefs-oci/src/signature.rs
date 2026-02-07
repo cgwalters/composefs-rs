@@ -7,10 +7,12 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use composefs::fsverity::algorithm::ComposeFsAlgorithm;
 use composefs::fsverity::FsVerityHashValue;
+use composefs::repository::Repository;
 use containers_image_proxy::oci_spec::image::{
     Descriptor, DescriptorBuilder, Digest as OciDigest, ImageManifest, ImageManifestBuilder,
     MediaType,
@@ -424,6 +426,123 @@ fn rank_to_name(rank: u8) -> &'static str {
         3 => "merged",
         _ => "unknown",
     }
+}
+
+// =============================================================================
+// Repository Storage and Discovery
+// =============================================================================
+
+/// Stores a signature artifact in the repository and indexes it as a referrer.
+///
+/// Writes the artifact's layer blobs and manifest, then creates a referrer
+/// index entry linking it to its subject image. The subject is extracted from
+/// the manifest's `subject` field.
+///
+/// Returns `(manifest_digest, manifest_verity)` for the stored artifact.
+pub fn store_signature_artifact<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    artifact: SignatureArtifact,
+) -> Result<(String, ObjectID)> {
+    // Write the empty config "{}"
+    let empty_config = b"{}";
+    let config_digest = sha256_digest(empty_config);
+    let config_id = crate::config_identifier(&config_digest);
+
+    let config_verity = match repo.has_stream(&config_id)? {
+        Some(v) => v,
+        None => {
+            let mut config_stream = repo.create_stream(crate::skopeo::OCI_CONFIG_CONTENT_TYPE);
+            config_stream.write_inline(empty_config);
+            repo.write_stream(config_stream, &config_id, None)?
+        }
+    };
+
+    // Write each layer blob and collect verity mappings
+    let mut layer_verities = HashMap::new();
+    for (descriptor, blob) in artifact.manifest.layers().iter().zip(&artifact.blobs) {
+        let (blob_digest, blob_verity) = crate::oci_image::write_blob(repo, blob)?;
+        // For artifacts, the layer descriptor's digest is the key
+        let desc_digest = descriptor.digest().to_string();
+
+        // Sanity check: the blob digest we computed should match the descriptor
+        if blob_digest != desc_digest {
+            anyhow::bail!(
+                "Layer blob digest mismatch: descriptor says {desc_digest}, \
+                 computed {blob_digest}"
+            );
+        }
+
+        layer_verities.insert(desc_digest.into_boxed_str(), blob_verity);
+    }
+
+    // Compute the manifest digest
+    let manifest_json = artifact.manifest.to_string()?;
+    let manifest_digest = sha256_digest(manifest_json.as_bytes());
+
+    // Write the manifest (no tag — referrer artifacts aren't typically tagged)
+    let (digest, verity) = crate::oci_image::write_manifest(
+        repo,
+        &artifact.manifest,
+        &manifest_digest,
+        &config_verity,
+        &layer_verities,
+        None,
+    )?;
+
+    // Extract the subject digest and create the referrer index entry
+    let subject = artifact
+        .manifest
+        .subject()
+        .as_ref()
+        .context("Signature artifact has no subject")?;
+    let subject_digest = subject.digest().to_string();
+
+    crate::oci_image::add_referrer(repo, &subject_digest, &digest)?;
+
+    Ok((digest, verity))
+}
+
+/// Finds and parses composefs signature artifacts referencing the given image.
+///
+/// Searches the local referrer index for artifacts with the composefs signature
+/// artifact type, then parses each one. Non-signature referrers are silently
+/// skipped.
+pub fn find_signature_artifacts<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    subject_digest: &str,
+) -> Result<Vec<ParsedSignatureArtifact>> {
+    use crate::oci_image::{list_referrers, OciImage};
+
+    let referrers = list_referrers(repo, subject_digest)?;
+    let mut results = Vec::new();
+
+    for (artifact_digest, artifact_verity) in &referrers {
+        // Open the artifact manifest
+        let image = match OciImage::open(repo, artifact_digest, Some(artifact_verity)) {
+            Ok(img) => img,
+            Err(e) => {
+                eprintln!("Warning: failed to open referrer artifact {artifact_digest}: {e:#}");
+                continue;
+            }
+        };
+
+        // Check if this is a composefs signature artifact
+        let manifest = image.manifest();
+        match manifest.artifact_type() {
+            Some(MediaType::Other(t)) if t == ARTIFACT_TYPE => {}
+            _ => continue, // Not a composefs signature artifact, skip
+        }
+
+        // Parse the signature artifact
+        match parse_signature_artifact(manifest) {
+            Ok(parsed) => results.push(parsed),
+            Err(e) => {
+                eprintln!("Warning: failed to parse signature artifact {artifact_digest}: {e:#}");
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 fn sha256_digest(data: &[u8]) -> String {
@@ -971,5 +1090,252 @@ mod tests {
             msg.contains("wrong layer media type"),
             "unexpected error: {msg}"
         );
+    }
+
+    // ==================== Repository Integration Tests ====================
+
+    use composefs::fsverity::Sha256HashValue;
+    use composefs::test::TestRepo;
+
+    /// Helper to create a minimal subject image in a test repository.
+    /// Returns (manifest_digest, manifest_verity).
+    fn create_subject_image(
+        repo: &std::sync::Arc<Repository<Sha256HashValue>>,
+    ) -> (String, Sha256HashValue) {
+        use containers_image_proxy::oci_spec::image::{
+            ConfigBuilder, ImageConfigurationBuilder, ImageManifestBuilder, RootFsBuilder,
+        };
+
+        let layer_data = b"fake-subject-layer";
+        let layer_digest = sha256_digest(layer_data);
+
+        let mut layer_stream = repo.create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE);
+        layer_stream.write_inline(layer_data);
+        let layer_verity = repo
+            .write_stream(layer_stream, &crate::layer_identifier(&layer_digest), None)
+            .unwrap();
+
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec![layer_digest.clone()])
+            .build()
+            .unwrap();
+        let cfg = ConfigBuilder::default().build().unwrap();
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .config(cfg)
+            .build()
+            .unwrap();
+
+        let config_json = config.to_string().unwrap();
+        let config_digest = sha256_digest(config_json.as_bytes());
+
+        let mut config_stream = repo.create_stream(crate::skopeo::OCI_CONFIG_CONTENT_TYPE);
+        config_stream.add_named_stream_ref(&layer_digest, &layer_verity);
+        config_stream.write_inline(config_json.as_bytes());
+        let config_verity = repo
+            .write_stream(
+                config_stream,
+                &crate::config_identifier(&config_digest),
+                None,
+            )
+            .unwrap();
+
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageConfig)
+            .digest(OciDigest::from_str(&config_digest).unwrap())
+            .size(config_json.len() as u64)
+            .build()
+            .unwrap();
+        let layer_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageLayerGzip)
+            .digest(OciDigest::from_str(&layer_digest).unwrap())
+            .size(layer_data.len() as u64)
+            .build()
+            .unwrap();
+
+        let manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor)
+            .layers(vec![layer_descriptor])
+            .build()
+            .unwrap();
+
+        let mut layer_verities = std::collections::HashMap::new();
+        layer_verities.insert(layer_digest.into_boxed_str(), layer_verity);
+
+        let manifest_json = manifest.to_string().unwrap();
+        let manifest_digest = sha256_digest(manifest_json.as_bytes());
+
+        let (digest, verity) = crate::oci_image::write_manifest(
+            repo,
+            &manifest,
+            &manifest_digest,
+            &config_verity,
+            &layer_verities,
+            Some("subject:v1"),
+        )
+        .unwrap();
+
+        (digest, verity)
+    }
+
+    #[test]
+    fn test_store_and_find_signature_artifact() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // Create a subject image
+        let (subject_digest, _subject_verity) = create_subject_image(repo);
+
+        // Build a signature artifact referencing the subject
+        let subject_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageManifest)
+            .digest(OciDigest::from_str(&subject_digest).unwrap())
+            .size(100u64)
+            .build()
+            .unwrap();
+
+        let layer_digest = fake_sha512_digest(0xab);
+        let merged_digest = fake_sha512_digest(0xcd);
+
+        let mut builder = SignatureArtifactBuilder::new(
+            composefs::fsverity::algorithm::SHA512_12,
+            subject_descriptor,
+        );
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: layer_digest.clone(),
+                signature: None,
+            })
+            .unwrap();
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Merged,
+                digest: merged_digest.clone(),
+                signature: None,
+            })
+            .unwrap();
+
+        let artifact = builder.build().unwrap();
+
+        // Store it
+        let (artifact_digest, _artifact_verity) = store_signature_artifact(repo, artifact).unwrap();
+
+        // Verify the manifest was stored
+        assert!(crate::oci_image::has_manifest(repo, &artifact_digest)
+            .unwrap()
+            .is_some());
+
+        // Find it by subject
+        let found = find_signature_artifacts(repo, &subject_digest).unwrap();
+        assert_eq!(found.len(), 1);
+
+        let parsed = &found[0];
+        assert_eq!(parsed.algorithm, composefs::fsverity::algorithm::SHA512_12);
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].sig_type, SignatureType::Layer);
+        assert_eq!(parsed.entries[0].digest, layer_digest);
+        assert_eq!(parsed.entries[1].sig_type, SignatureType::Merged);
+        assert_eq!(parsed.entries[1].digest, merged_digest);
+
+        // Subject descriptor should be preserved
+        assert_eq!(parsed.subject.digest().to_string(), subject_digest);
+
+        // Querying a different subject should return empty
+        let other = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let found = find_signature_artifacts(repo, other).unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn test_store_multiple_signature_artifacts() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (subject_digest, _) = create_subject_image(repo);
+
+        let subject_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageManifest)
+            .digest(OciDigest::from_str(&subject_digest).unwrap())
+            .size(100u64)
+            .build()
+            .unwrap();
+
+        // Store two signature artifacts for the same subject
+        for seed in [0xaau8, 0xbbu8] {
+            let mut builder = SignatureArtifactBuilder::new(
+                composefs::fsverity::algorithm::SHA512_12,
+                subject_descriptor.clone(),
+            );
+            builder
+                .add_entry(SignatureEntry {
+                    sig_type: SignatureType::Layer,
+                    digest: fake_sha512_digest(seed),
+                    signature: None,
+                })
+                .unwrap();
+            let artifact = builder.build().unwrap();
+            store_signature_artifact(repo, artifact).unwrap();
+        }
+
+        let found = find_signature_artifacts(repo, &subject_digest).unwrap();
+        assert_eq!(found.len(), 2);
+
+        let digests: Vec<&str> = found.iter().map(|p| p.entries[0].digest.as_str()).collect();
+        assert!(digests.contains(&fake_sha512_digest(0xaa).as_str()));
+        assert!(digests.contains(&fake_sha512_digest(0xbb).as_str()));
+    }
+
+    #[test]
+    fn test_store_signature_with_blobs() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (subject_digest, _) = create_subject_image(repo);
+
+        let subject_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageManifest)
+            .digest(OciDigest::from_str(&subject_digest).unwrap())
+            .size(100u64)
+            .build()
+            .unwrap();
+
+        let fake_sig = vec![0x30, 0x82, 0x01, 0x00, 0xAB, 0xCD, 0xEF];
+        let mut builder = SignatureArtifactBuilder::new(
+            composefs::fsverity::algorithm::SHA512_12,
+            subject_descriptor,
+        );
+        builder
+            .add_entry(SignatureEntry {
+                sig_type: SignatureType::Layer,
+                digest: fake_sha512_digest(0x11),
+                signature: Some(fake_sig.clone()),
+            })
+            .unwrap();
+
+        let artifact = builder.build().unwrap();
+        let (artifact_digest, _) = store_signature_artifact(repo, artifact).unwrap();
+
+        // Find it and verify the parsed result
+        let found = find_signature_artifacts(repo, &subject_digest).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].entries[0].sig_type, SignatureType::Layer);
+        assert_eq!(found[0].entries[0].digest, fake_sha512_digest(0x11));
+
+        // Verify we can open the artifact as an OciImage and read the blob
+        let image = crate::oci_image::OciImage::open(repo, &artifact_digest, None).unwrap();
+        assert!(!image.is_container_image());
+
+        // The layer blob should be retrievable
+        let layer_desc = &image.layer_descriptors()[0];
+        let blob_digest = layer_desc.digest().to_string();
+        let blob_verity = image.layer_verity(&blob_digest).unwrap();
+        let blob_data = crate::oci_image::open_blob(repo, &blob_digest, Some(blob_verity)).unwrap();
+        assert_eq!(blob_data, fake_sig);
     }
 }
