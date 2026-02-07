@@ -85,6 +85,43 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
+/// Compute per-layer composefs digests for an OCI image.
+///
+/// For each layer, builds a single-layer filesystem and computes its EROFS fsverity digest.
+/// These digests can be stored in a composefs signature artifact.
+///
+/// Per-layer digests are computed without `transform_for_oci()` since individual layers
+/// typically don't have the `/usr` directory needed for the OCI root metadata transform.
+///
+/// The final merged digest (the digest of the complete flattened filesystem with
+/// `transform_for_oci()` applied) can be obtained from `seal()` or `create_filesystem()`.
+#[context("Computing per-layer digests")]
+pub fn compute_per_layer_digests<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_name: &str,
+    config_verity: Option<&ObjectID>,
+) -> Result<Vec<ObjectID>> {
+    let (config, map) = crate::open_config(repo, config_name, config_verity)?;
+
+    let mut layer_digests = Vec::with_capacity(config.rootfs().diff_ids().len());
+
+    for diff_id in config.rootfs().diff_ids() {
+        let layer_verity = map
+            .get(diff_id.as_str())
+            .context("OCI config splitstream missing named ref to layer")?;
+
+        let mut single_fs = FileSystem::new(Stat::uninitialized());
+        let mut layer_stream =
+            repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
+        while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
+            process_entry(&mut single_fs, entry)?;
+        }
+        layer_digests.push(single_fs.compute_image_id());
+    }
+
+    Ok(layer_digests)
+}
+
 /// Creates a filesystem from the given OCI container.  No special transformations are performed to
 /// make the filesystem bootable.
 ///

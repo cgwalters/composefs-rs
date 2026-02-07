@@ -32,6 +32,7 @@ pub use oci_image::{
     list_images, list_refs, resolve_ref, tag_image, untag_image, ImageInfo, OciImage,
     OCI_REF_PREFIX,
 };
+pub use image::compute_per_layer_digests;
 pub use skopeo::{pull_image, PullResult};
 
 type ContentAndVerity<ObjectID> = (String, ObjectID);
