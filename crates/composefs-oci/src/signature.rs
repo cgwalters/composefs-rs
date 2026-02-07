@@ -1338,4 +1338,214 @@ mod tests {
         let blob_data = crate::oci_image::open_blob(repo, &blob_digest, Some(blob_verity)).unwrap();
         assert_eq!(blob_data, fake_sig);
     }
+
+    // ==================== End-to-End Integration Test ====================
+
+    /// Full seal → sign → discover → verify workflow using real tar layers
+    /// and the actual composefs pipeline (import_layer, write_config, seal,
+    /// compute_per_layer_digests, store_signature_artifact, find_signature_artifacts).
+    #[test]
+    fn test_end_to_end_seal_sign_verify() {
+        use composefs::fsverity::FsVerityHashValue;
+        use containers_image_proxy::oci_spec::image::{
+            ConfigBuilder, ImageConfigurationBuilder, ImageManifestBuilder, RootFsBuilder,
+        };
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // --- 1. Build a tar layer with /usr (required by transform_for_oci in seal) ---
+        let mut builder = ::tar::Builder::new(vec![]);
+        {
+            let mut header = ::tar::Header::new_ustar();
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(0o755);
+            header.set_entry_type(::tar::EntryType::Directory);
+            header.set_size(0);
+            builder
+                .append_data(&mut header, "usr", std::io::empty())
+                .unwrap();
+        }
+        {
+            let data = b"hello composefs";
+            let mut header = ::tar::Header::new_ustar();
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(0o644);
+            header.set_entry_type(::tar::EntryType::Regular);
+            header.set_size(data.len() as u64);
+            builder
+                .append_data(&mut header, "usr/hello.txt", &data[..])
+                .unwrap();
+        }
+        let tar_data = builder.into_inner().unwrap();
+
+        let diff_id = {
+            use sha2::{Digest, Sha256};
+            let mut ctx = Sha256::new();
+            ctx.update(&tar_data);
+            format!("sha256:{}", hex::encode(ctx.finalize()))
+        };
+
+        // --- 2. Import the layer ---
+        let layer_verity =
+            crate::import_layer(repo, &diff_id, None, &mut tar_data.as_slice()).unwrap();
+
+        // --- 3. Create an OCI config referencing this layer ---
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec![diff_id.clone()])
+            .build()
+            .unwrap();
+        let cfg = ConfigBuilder::default().build().unwrap();
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .config(cfg)
+            .build()
+            .unwrap();
+
+        let mut refs = std::collections::HashMap::new();
+        refs.insert(Box::from(diff_id.as_str()), layer_verity);
+
+        let (config_digest, config_verity) = crate::write_config(repo, &config, refs).unwrap();
+
+        // --- 4. Seal the image (computes merged composefs digest) ---
+        let (sealed_config_digest, sealed_config_verity) =
+            crate::seal(repo, &config_digest, Some(&config_verity)).unwrap();
+
+        // --- 5. Read the merged digest from the sealed config's label ---
+        let (sealed_config, _sealed_refs) =
+            crate::open_config(repo, &sealed_config_digest, Some(&sealed_config_verity)).unwrap();
+        let expected_merged_hex = sealed_config
+            .get_config_annotation("containers.composefs.fsverity")
+            .expect("sealed config must have containers.composefs.fsverity label")
+            .to_string();
+        let expected_merged =
+            Sha256HashValue::from_hex(&expected_merged_hex).expect("valid hex in label");
+
+        // --- 6. Compute per-layer digests ---
+        let per_layer_digests = crate::image::compute_per_layer_digests(
+            repo,
+            &sealed_config_digest,
+            Some(&sealed_config_verity),
+        )
+        .unwrap();
+        assert_eq!(
+            per_layer_digests.len(),
+            1,
+            "expected exactly 1 layer digest"
+        );
+
+        // --- 7. Build a source image manifest so we have a subject descriptor ---
+        let sealed_config_json = sealed_config.to_string().unwrap();
+        let sealed_config_content_digest = sha256_digest(sealed_config_json.as_bytes());
+
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageConfig)
+            .digest(OciDigest::from_str(&sealed_config_content_digest).unwrap())
+            .size(sealed_config_json.len() as u64)
+            .build()
+            .unwrap();
+
+        let layer_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageLayerGzip)
+            .digest(OciDigest::from_str(&diff_id).unwrap())
+            .size(tar_data.len() as u64)
+            .build()
+            .unwrap();
+
+        let source_manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor)
+            .layers(vec![layer_descriptor])
+            .build()
+            .unwrap();
+
+        // We need the sealed config's verity and the layer verity for writing the manifest
+        let mut layer_verities_map = std::collections::HashMap::new();
+        // Re-import the layer verity since seal() wrote a new config
+        let layer_verity_again = repo
+            .has_stream(&crate::layer_identifier(&diff_id))
+            .unwrap()
+            .expect("layer should exist");
+        layer_verities_map.insert(diff_id.clone().into_boxed_str(), layer_verity_again);
+
+        let source_manifest_json = source_manifest.to_string().unwrap();
+        let source_manifest_digest = sha256_digest(source_manifest_json.as_bytes());
+
+        let (stored_manifest_digest, _manifest_verity) = crate::oci_image::write_manifest(
+            repo,
+            &source_manifest,
+            &source_manifest_digest,
+            &sealed_config_verity,
+            &layer_verities_map,
+            Some("e2e-test:v1"),
+        )
+        .unwrap();
+
+        // --- 8. Build and store a signature artifact ---
+        let subject_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageManifest)
+            .digest(OciDigest::from_str(&stored_manifest_digest).unwrap())
+            .size(source_manifest_json.len() as u64)
+            .build()
+            .unwrap();
+
+        let mut sig_builder = SignatureArtifactBuilder::new(
+            composefs::fsverity::algorithm::SHA256_12,
+            subject_descriptor,
+        );
+        sig_builder.add_layer_digests(&per_layer_digests).unwrap();
+        sig_builder.add_merged_digest(&expected_merged).unwrap();
+
+        let artifact = sig_builder.build().unwrap();
+        let (_artifact_digest, _artifact_verity) =
+            store_signature_artifact(repo, artifact).unwrap();
+
+        // --- 9. Discover the artifact via find_signature_artifacts ---
+        let found = find_signature_artifacts(repo, &stored_manifest_digest).unwrap();
+        assert_eq!(found.len(), 1, "expected exactly 1 signature artifact");
+
+        let parsed = &found[0];
+
+        // Verify algorithm
+        assert_eq!(
+            parsed.algorithm,
+            composefs::fsverity::algorithm::SHA256_12,
+            "algorithm should be SHA256_12"
+        );
+
+        // Verify entries: 1 layer + 1 merged = 2
+        assert_eq!(
+            parsed.entries.len(),
+            2,
+            "expected 2 entries (layer + merged)"
+        );
+
+        // Verify layer digest matches compute_per_layer_digests output
+        assert_eq!(parsed.entries[0].sig_type, SignatureType::Layer);
+        assert_eq!(
+            parsed.entries[0].digest,
+            per_layer_digests[0].to_hex(),
+            "layer digest must match compute_per_layer_digests output"
+        );
+
+        // Verify merged digest matches the sealed config label
+        assert_eq!(parsed.entries[1].sig_type, SignatureType::Merged);
+        assert_eq!(
+            parsed.entries[1].digest, expected_merged_hex,
+            "merged digest must match containers.composefs.fsverity label"
+        );
+
+        // Verify subject descriptor is preserved
+        assert_eq!(
+            parsed.subject.digest().to_string(),
+            stored_manifest_digest,
+            "subject descriptor must reference the source image manifest"
+        );
+    }
 }

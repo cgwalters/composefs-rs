@@ -31,8 +31,9 @@ use crate::tar::get_entry;
 // Re-export key types for convenience
 pub use image::compute_per_layer_digests;
 pub use oci_image::{
-    add_referrer, list_images, list_referrers, list_refs, resolve_ref, tag_image, untag_image,
-    ImageInfo, OciImage, OCI_REF_PREFIX,
+    add_referrer, list_images, list_referrers, list_refs, remove_referrer,
+    remove_referrers_for_subject, resolve_ref, tag_image, untag_image, ImageInfo, OciImage,
+    OCI_REF_PREFIX,
 };
 pub use skopeo::{pull_image, PullResult};
 

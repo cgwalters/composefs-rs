@@ -430,8 +430,7 @@ pub fn list_images<ObjectID: FsVerityHashValue>(
                     layer_count: img.layer_descriptors().len(),
                 });
             }
-            Err(e) => {
-                eprintln!("Warning: failed to open image {name} ({digest}): {e:#}");
+            Err(_) => {
                 continue;
             }
         }
@@ -656,10 +655,6 @@ pub fn list_referrers<ObjectID: FsVerityHashValue>(
         if let Some(digest) = manifest_part.strip_prefix("oci-manifest-") {
             // Verify consistency: the ref name should match the target
             if digest != artifact_digest {
-                eprintln!(
-                    "Warning: referrer ref name ({artifact_digest}) does not match \
-                     target manifest ({digest}), skipping"
-                );
                 continue;
             }
         }
@@ -668,14 +663,53 @@ pub fn list_referrers<ObjectID: FsVerityHashValue>(
         match repo.has_stream(&manifest_identifier(&artifact_digest))? {
             Some(verity) => referrers.push((artifact_digest, verity)),
             None => {
-                eprintln!(
-                    "Warning: referrer index points to missing manifest {artifact_digest}, skipping"
-                );
+                continue;
             }
         }
     }
 
     Ok(referrers)
+}
+
+/// Removes a specific referrer index entry.
+///
+/// Idempotent — returns Ok if the entry doesn't exist.
+pub fn remove_referrer<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    subject_digest: &str,
+    artifact_digest: &str,
+) -> Result<()> {
+    let ref_path = format!(
+        "streams/refs/{REFERRER_REF_PREFIX}{}/{}",
+        encode_tag(subject_digest),
+        encode_tag(artifact_digest)
+    );
+    match unlinkat(repo.repo_fd(), &ref_path, AtFlags::empty()) {
+        Ok(()) => Ok(()),
+        Err(Errno::NOENT) => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("Failed to remove referrer {artifact_digest}")),
+    }
+}
+
+/// Removes all referrer index entries for a subject.
+///
+/// Removes each referrer symlink and tries to remove the empty subject
+/// directory afterwards. Idempotent — returns Ok if no entries exist.
+pub fn remove_referrers_for_subject<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    subject_digest: &str,
+) -> Result<()> {
+    let referrers = list_referrers(repo, subject_digest)?;
+    for (artifact_digest, _verity) in &referrers {
+        remove_referrer(repo, subject_digest, artifact_digest)?;
+    }
+    // Try to remove the now-empty subject directory (ignore errors)
+    let subject_dir = format!(
+        "streams/refs/{REFERRER_REF_PREFIX}{}",
+        encode_tag(subject_digest)
+    );
+    let _ = unlinkat(repo.repo_fd(), &subject_dir, AtFlags::REMOVEDIR);
+    Ok(())
 }
 
 /// Removes referrer index entries whose subject manifest no longer exists.
@@ -744,14 +778,11 @@ pub fn cleanup_dangling_referrers<ObjectID: FsVerityHashValue>(
             Ok(fd) => fd,
             Err(Errno::NOENT) => continue,
             Err(e) => {
-                return Err(e)
-                    .context(format!("Opening referrer subject dir {encoded_subject}"))?
+                return Err(e).context(format!("Opening referrer subject dir {encoded_subject}"))?
             }
         };
 
-        for item in Dir::read_from(&subject_dir_fd)
-            .context("Reading referrer subject directory")?
-        {
+        for item in Dir::read_from(&subject_dir_fd).context("Reading referrer subject directory")? {
             let entry = item.context("Reading referrer entry")?;
             let name = entry.file_name();
             if name == c"." || name == c".." {
@@ -763,12 +794,8 @@ pub fn cleanup_dangling_referrers<ObjectID: FsVerityHashValue>(
         }
 
         // Remove the now-empty subject directory
-        unlinkat(
-            &referrers_dir,
-            encoded_subject.as_str(),
-            AtFlags::REMOVEDIR,
-        )
-        .with_context(|| format!("Removing empty referrer subject dir {encoded_subject}"))?;
+        unlinkat(&referrers_dir, encoded_subject.as_str(), AtFlags::REMOVEDIR)
+            .with_context(|| format!("Removing empty referrer subject dir {encoded_subject}"))?;
     }
 
     Ok(removed)
@@ -2224,10 +2251,7 @@ mod test {
 
         // 8. Second GC pass: now collects the artifact (no longer rooted)
         let gc2 = repo.gc(&[]).unwrap();
-        assert!(
-            gc2.objects_removed > 0,
-            "should collect artifact objects"
-        );
+        assert!(gc2.objects_removed > 0, "should collect artifact objects");
 
         // 9. Verify the artifact manifest is gone
         assert!(
@@ -2237,10 +2261,7 @@ mod test {
 
         // 10. Verify list_referrers returns empty
         let referrers = list_referrers(repo, &subject_digest).unwrap();
-        assert!(
-            referrers.is_empty(),
-            "no referrers should remain after GC"
-        );
+        assert!(referrers.is_empty(), "no referrers should remain after GC");
 
         // Also verify the subject manifest is gone
         assert!(
@@ -2278,10 +2299,8 @@ mod test {
         let repo = &test_repo.repo;
 
         // Create two subjects
-        let (subject1_digest, _, _) =
-            create_test_image(repo, Some("subject1:v1"), "amd64");
-        let (subject2_digest, _, _) =
-            create_test_image(repo, Some("subject2:v1"), "arm64");
+        let (subject1_digest, _, _) = create_test_image(repo, Some("subject1:v1"), "amd64");
+        let (subject2_digest, _, _) = create_test_image(repo, Some("subject2:v1"), "arm64");
 
         // Create artifacts for both
         let (artifact1_digest, _) = create_test_artifact(repo, b"sig-for-subject1");
@@ -2325,5 +2344,48 @@ mod test {
 
         let cleaned = cleanup_dangling_referrers(repo).unwrap();
         assert_eq!(cleaned, 0);
+    }
+
+    /// Test removing a single referrer: add, remove, verify gone, and
+    /// confirm that a second remove is idempotent (no error).
+    #[test]
+    fn test_remove_referrer() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (subject_digest, _, _) = create_test_image(repo, Some("subject:v1"), "amd64");
+        let (artifact_digest, _) = create_test_artifact(repo, b"sig-remove-test");
+
+        add_referrer(repo, &subject_digest, &artifact_digest).unwrap();
+        assert_eq!(list_referrers(repo, &subject_digest).unwrap().len(), 1);
+
+        // Remove the referrer
+        remove_referrer(repo, &subject_digest, &artifact_digest).unwrap();
+        assert!(list_referrers(repo, &subject_digest).unwrap().is_empty());
+
+        // Second remove is idempotent
+        remove_referrer(repo, &subject_digest, &artifact_digest).unwrap();
+    }
+
+    /// Test removing all referrers for a subject at once.
+    #[test]
+    fn test_remove_referrers_for_subject() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let (subject_digest, _, _) = create_test_image(repo, Some("subject:v1"), "amd64");
+        let (artifact1_digest, _) = create_test_artifact(repo, b"sig-bulk-1");
+        let (artifact2_digest, _) = create_test_artifact(repo, b"sig-bulk-2");
+
+        add_referrer(repo, &subject_digest, &artifact1_digest).unwrap();
+        add_referrer(repo, &subject_digest, &artifact2_digest).unwrap();
+        assert_eq!(list_referrers(repo, &subject_digest).unwrap().len(), 2);
+
+        // Remove all referrers for this subject
+        remove_referrers_for_subject(repo, &subject_digest).unwrap();
+        assert!(list_referrers(repo, &subject_digest).unwrap().is_empty());
+
+        // Idempotent: calling again on an already-empty subject is fine
+        remove_referrers_for_subject(repo, &subject_digest).unwrap();
     }
 }
