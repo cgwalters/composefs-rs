@@ -38,27 +38,49 @@ Branch: `sealing-impl` (based on `oci-native-layer` / PR #216)
   - Two-pass GC: untag → gc → cleanup_dangling → gc removes artifacts
 - [x] End-to-end integration test (`test_end_to_end_seal_sign_verify`)
   - seal → compute_per_layer_digests → build artifact → store → discover → verify
+- [x] `fsverity_formatted_digest` construction (`crates/composefs/src/fsverity/formatted_digest.rs`)
+  - Kernel-compatible byte layout: magic + LE algorithm + LE size + digest
+- [x] `fs_ioc_enable_verity_with_sig` ioctl wrapper
+  - Accepts optional PKCS#7 DER blob for kernel-level signature enforcement
+  - Existing `fs_ioc_enable_verity` delegates to it with `None`
+- [x] PKCS#7 signing library (`crates/composefs-oci/src/signing.rs`, feature-gated)
+  - `FsVeritySigningKey`: load PEM cert+key, sign digests → DER PKCS#7
+  - `FsVeritySignatureVerifier`: verify PKCS#7 against trusted cert
+  - Input validation: digest length vs algorithm, cert-key mismatch check
+  - 8 unit tests including wrong-digest, wrong-cert, tampered-sig rejection
+- [x] External `openssl` CLI workflow documented + tested
+  - Spec section with exact byte layout and shell commands
+  - `tests/test-openssl-sign.sh`: 9 tests including wrong-cert rejection
+- [x] `cfsctl oci sign` and `cfsctl oci verify` CLI commands
+  - sign: seal check → per-layer digests → PKCS#7 sign → store artifact
+  - verify: discover artifacts → recompute digests → compare
+  - Errors on missing artifacts, errors when --cert used (blob verification TBD)
+- [x] Security review of signing implementation
+  - Cryptographic correctness verified (flags, formatted_digest layout)
+  - Fixed -noverify in docs and tests
+  - Trust model documented (application-level vs kernel-level signatures)
+- [x] Tests: 79 passing in composefs-oci (with signing), 9 shell tests
 
 ## Remaining
 
-### Nice-to-have / follow-up
+### Follow-up work
 
-- [ ] PKCS#7 signing integration
-  - Actual signature generation (currently only stores pre-built blobs)
-  - Needs a signing key management story
-  - Probably `openssl` or `ring` crate for PKCS#7 DER construction
-- [ ] Registry push support for signature artifacts
-  - Push artifact manifest + blobs to registry alongside the image
-  - Requires registry write support (not yet in composefs-rs)
-- [ ] Registry pull support for signature artifacts
+- [ ] Wire up PKCS#7 blob verification in `cfsctl oci verify --cert`
+  - Need to fetch blobs from artifact layers via `open_blob()`
+  - Then verify with `FsVeritySignatureVerifier`
+- [ ] Registry push/pull for signature artifacts
+  - Push artifact manifest + blobs alongside image
   - Query `/referrers/{digest}` API during pull
-  - Download and store signature artifacts locally
 - [ ] Per-layer EROFS persistence
   - Currently per-layer digests are computed transiently
   - Could store per-layer EROFS in repo for later verification
-- [ ] `cfsctl` CLI integration
-  - `cfsctl sign` / `cfsctl verify` commands
-  - `cfsctl seal --sign` to seal + create signature artifact in one step
+- [ ] `cfsctl seal --sign` convenience command
+  - Seal + create signature artifact in one step
+- [ ] Kernel-level signature enforcement integration testing
+  - Requires VM with ext4/btrfs + `.fs-verity` keyring configured
+  - Test `enable_verity_raw_with_sig` with real filesystem
+- [ ] Cosign/sigstore integration
+  - Sign/verify the signature artifact manifest itself
 
 ## Architecture Notes
 
@@ -79,8 +101,15 @@ streams/
 The artifact's `subject` field points to the source image's manifest digest.
 Discovery: `list_referrers(repo, "sha256:aaa...")` returns the artifact.
 
-Trust model: the signature artifact provides composefs fsverity digests for
-each component. With PKCS#7 signatures, the kernel enforces the digest at
-`FS_IOC_ENABLE_VERITY` time. Without signatures (digest-only mode), the
-artifact provides a verifiable record of expected digests but enforcement
-is up to the consumer.
+Trust model: two levels of signature enforcement are supported.
+
+**Application-level** (primary): PKCS#7 signatures are stored in the OCI
+signature artifact and verified in userspace by composefs tooling. This
+works with standard OCI registries and doesn't require kernel configuration.
+
+**Kernel-level** (optional): PKCS#7 blobs can be passed to
+`FS_IOC_ENABLE_VERITY` via `enable_verity_raw_with_sig()`. The kernel
+verifies against the `.fs-verity` keyring. Requires root to configure.
+
+Both use the same PKCS#7 DER format over `fsverity_formatted_digest`,
+so signatures are interchangeable between the two models.
