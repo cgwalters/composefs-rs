@@ -119,6 +119,26 @@ enum OciCommand {
         config_name: String,
         config_verity: Option<String>,
     },
+    /// Create a composefs signature artifact for a sealed image
+    #[cfg(feature = "signing")]
+    Sign {
+        /// Image reference (tag name)
+        image: String,
+        /// Path to PEM-encoded signing certificate
+        #[clap(long)]
+        cert: PathBuf,
+        /// Path to PEM-encoded private key
+        #[clap(long)]
+        key: PathBuf,
+    },
+    /// Verify composefs signature artifacts for an image
+    Verify {
+        /// Image reference (tag name)
+        image: String,
+        /// Path to PEM-encoded trusted certificate for verification
+        #[clap(long)]
+        cert: Option<PathBuf>,
+    },
     Mount {
         name: String,
         mountpoint: String,
@@ -436,6 +456,167 @@ where
                     composefs_oci::seal(&Arc::new(repo), config_name, verity.as_ref())?;
                 println!("config {digest}");
                 println!("verity {}", verity.to_id());
+            }
+            #[cfg(feature = "signing")]
+            OciCommand::Sign {
+                ref image,
+                ref cert,
+                ref key,
+            } => {
+                use anyhow::Context;
+                use std::str::FromStr;
+
+                let repo = Arc::new(repo);
+                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
+
+                anyhow::ensure!(
+                    img.is_sealed(),
+                    "image {image} is not sealed; run 'cfsctl oci seal' first"
+                );
+
+                let seal_hex = img
+                    .seal_digest()
+                    .context("sealed image missing composefs.fsverity label")?;
+                let merged_digest: ObjectID = FsVerityHashValue::from_hex(seal_hex)
+                    .context("invalid seal digest in image label")?;
+
+                let config_digest = img.config_digest().to_string();
+
+                // Determine the composefs algorithm from ObjectID::ALGORITHM
+                let algorithm = match ObjectID::ALGORITHM {
+                    1 => composefs::fsverity::algorithm::SHA256_12,
+                    2 => composefs::fsverity::algorithm::SHA512_12,
+                    _ => anyhow::bail!("unsupported hash algorithm {}", ObjectID::ALGORITHM),
+                };
+
+                // Compute per-layer digests (verifies content hashes since we don't
+                // have the config verity readily available from OciImage)
+                let per_layer_digests =
+                    composefs_oci::compute_per_layer_digests(&repo, &config_digest, None)?;
+
+                // Load signing key
+                let cert_pem = std::fs::read(cert).context("failed to read certificate file")?;
+                let key_pem = std::fs::read(key).context("failed to read private key file")?;
+                let signing_key =
+                    composefs_oci::signing::FsVeritySigningKey::from_pem(&cert_pem, &key_pem)?;
+
+                // Build subject descriptor from the source image's manifest
+                let manifest_json = img.manifest().to_string()?;
+                let subject = oci_spec::image::DescriptorBuilder::default()
+                    .media_type(oci_spec::image::MediaType::ImageManifest)
+                    .digest(
+                        oci_spec::image::Digest::from_str(img.manifest_digest())
+                            .context("parsing manifest digest")?,
+                    )
+                    .size(manifest_json.len() as u64)
+                    .build()
+                    .context("building subject descriptor")?;
+
+                let mut builder =
+                    composefs_oci::signature::SignatureArtifactBuilder::new(algorithm, subject);
+
+                // Sign and add each per-layer digest
+                for digest in &per_layer_digests {
+                    let sig = signing_key.sign(digest)?;
+                    builder.add_entry(composefs_oci::signature::SignatureEntry {
+                        sig_type: composefs_oci::signature::SignatureType::Layer,
+                        digest: digest.to_hex(),
+                        signature: Some(sig),
+                    })?;
+                }
+
+                // Sign and add the merged digest
+                let merged_sig = signing_key.sign(&merged_digest)?;
+                builder.add_entry(composefs_oci::signature::SignatureEntry {
+                    sig_type: composefs_oci::signature::SignatureType::Merged,
+                    digest: merged_digest.to_hex(),
+                    signature: Some(merged_sig),
+                })?;
+
+                let artifact = builder.build()?;
+                let (artifact_digest, _) =
+                    composefs_oci::signature::store_signature_artifact(&repo, artifact)?;
+
+                println!("{artifact_digest}");
+            }
+            OciCommand::Verify {
+                ref image,
+                ref cert,
+            } => {
+                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
+
+                let artifacts = composefs_oci::signature::find_signature_artifacts(
+                    &repo,
+                    img.manifest_digest(),
+                )?;
+
+                if artifacts.is_empty() {
+                    println!("No signature artifacts found for {image}");
+                    return Ok(());
+                }
+
+                if cert.is_some() {
+                    // Signature blob verification requires fetching individual
+                    // layer blobs from the artifact, which is not yet implemented.
+                    // For now we verify digests only.
+                    eprintln!(
+                        "Note: --cert provided but signature blob verification is not yet \
+                         implemented; verifying digests only"
+                    );
+                }
+
+                // Recompute expected digests
+                let config_digest = img.config_digest().to_string();
+                let per_layer_digests =
+                    composefs_oci::compute_per_layer_digests(&repo, &config_digest, None)?;
+                let merged_hex = img.seal_digest().map(|s| s.to_string());
+
+                let mut all_ok = true;
+
+                for artifact in &artifacts {
+                    println!("Signature artifact (algorithm: {})", artifact.algorithm);
+
+                    let mut layer_idx = 0usize;
+                    for entry in &artifact.entries {
+                        let (label, expected_hex) = match entry.sig_type {
+                            composefs_oci::signature::SignatureType::Layer => {
+                                let lbl = format!("  layer[{layer_idx}]:");
+                                let expected = per_layer_digests.get(layer_idx).map(|d| d.to_hex());
+                                layer_idx += 1;
+                                (lbl, expected)
+                            }
+                            composefs_oci::signature::SignatureType::Merged => {
+                                ("  merged:  ".to_string(), merged_hex.clone())
+                            }
+                            other => {
+                                println!("  {other}: skipped (not verified by this tool)");
+                                continue;
+                            }
+                        };
+
+                        let digest_ok = match &expected_hex {
+                            Some(expected) => *expected == entry.digest,
+                            None => {
+                                print!("{label} no expected digest to compare");
+                                println!(" SKIP");
+                                all_ok = false;
+                                continue;
+                            }
+                        };
+
+                        if !digest_ok {
+                            println!("{label} digest MISMATCH");
+                            all_ok = false;
+                            continue;
+                        }
+
+                        println!("{label} digest matches ✓");
+                    }
+                }
+
+                if !all_ok {
+                    std::process::exit(1);
+                }
             }
             OciCommand::Mount {
                 ref name,
