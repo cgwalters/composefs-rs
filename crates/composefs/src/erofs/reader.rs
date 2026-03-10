@@ -239,17 +239,24 @@ impl XAttr {
 
     /// Returns the attribute name suffix
     pub fn suffix(&self) -> &[u8] {
-        &self.data[..self.header.name_len as usize]
+        self.data
+            .get(..self.header.name_len as usize)
+            .unwrap_or(&[])
     }
 
     /// Returns the attribute value
     pub fn value(&self) -> &[u8] {
-        &self.data[self.header.name_len as usize..][..self.header.value_size.get() as usize]
+        let name_len = self.header.name_len as usize;
+        let value_size = self.header.value_size.get() as usize;
+        self.data
+            .get(name_len..name_len + value_size)
+            .unwrap_or(&[])
     }
 
     /// Returns the padding bytes after the value
     pub fn padding(&self) -> &[u8] {
-        &self.data[self.header.name_len as usize + self.header.value_size.get() as usize..]
+        let end = self.header.name_len as usize + self.header.value_size.get() as usize;
+        self.data.get(end..).unwrap_or(&[])
     }
 }
 
@@ -319,7 +326,7 @@ impl<Header: InodeHeader> InodeOps for &Inode<Header> {
     }
 
     fn inline(&self) -> Option<&[u8]> {
-        let data = &self.data[self.header.xattr_size()..];
+        let data = self.data.get(self.header.xattr_size()..)?;
 
         if data.is_empty() {
             return None;
@@ -970,7 +977,14 @@ pub fn collect_objects<ObjectID: FsVerityHashValue>(
 
 /// Construct the full xattr name from a prefix index and suffix.
 fn construct_xattr_name(xattr: &XAttr) -> Result<Vec<u8>, ReaderError> {
-    let prefix = XATTR_PREFIXES[xattr.header.name_index as usize];
+    let prefix = *XATTR_PREFIXES
+        .get(xattr.header.name_index as usize)
+        .ok_or_else(|| {
+            ReaderError::InvalidImage(format!(
+                "xattr name_index {} out of range",
+                xattr.header.name_index
+            ))
+        })?;
     let suffix = xattr.suffix();
     let mut full_name = Vec::with_capacity(prefix.len() + suffix.len());
     full_name.extend_from_slice(prefix);
