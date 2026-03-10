@@ -53,7 +53,6 @@ mod tests {
     fn test_dump_empty_root() {
         let input = "/ 4096 40755 2 0 0 0 0.0 - - -\n";
         let output = roundtrip_test(input);
-        // Output should have a root entry
         assert!(output.starts_with("/ "), "Output: {}", output);
         assert!(output.contains(" 40755 "), "Output: {}", output);
     }
@@ -104,16 +103,13 @@ mod tests {
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(input).unwrap();
         let image = mkfs_erofs(&fs, FormatVersion::default());
 
-        // Test with filter for file1 only
         let mut output = Vec::new();
         let filters = vec!["file1".to_string()];
         dump_erofs(&mut output, &image, &filters).unwrap();
         let output_str = String::from_utf8(output).unwrap();
 
-        // Should contain root and file1
         assert!(output_str.contains("/ "), "Output: {}", output_str);
         assert!(output_str.contains("/file1 "), "Output: {}", output_str);
-        // Should NOT contain file2 or dir
         assert!(
             !output_str.contains("/file2 "),
             "file2 should be filtered out: {}",
@@ -136,13 +132,11 @@ mod tests {
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(input).unwrap();
         let image = mkfs_erofs(&fs, FormatVersion::default());
 
-        // Test with filter for file1 and dir
         let mut output = Vec::new();
         let filters = vec!["file1".to_string(), "dir".to_string()];
         dump_erofs(&mut output, &image, &filters).unwrap();
         let output_str = String::from_utf8(output).unwrap();
 
-        // Should contain root, file1, dir, and nested file inside dir
         assert!(output_str.contains("/ "), "Output: {}", output_str);
         assert!(output_str.contains("/file1 "), "Output: {}", output_str);
         assert!(output_str.contains("/dir "), "Output: {}", output_str);
@@ -151,7 +145,6 @@ mod tests {
             "nested file in dir should be included: {}",
             output_str
         );
-        // Should NOT contain file2
         assert!(
             !output_str.contains("/file2 "),
             "file2 should be filtered out: {}",

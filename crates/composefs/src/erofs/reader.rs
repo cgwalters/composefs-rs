@@ -73,6 +73,12 @@ pub trait InodeHeader {
         self.u()
     }
 
+    /// Returns true if this inode is a whiteout entry (character device with rdev == 0).
+    fn is_whiteout(&self) -> bool {
+        let mode = self.mode().0.get();
+        (mode & S_IFMT == S_IFCHR) && (self.rdev() == 0)
+    }
+
     /// Calculates the number of additional bytes after the header
     fn additional_bytes(&self, blkszbits: u8) -> Result<usize, ReaderError> {
         let block_size: usize = 1usize
@@ -238,25 +244,25 @@ impl XAttr {
     }
 
     /// Returns the attribute name suffix
-    pub fn suffix(&self) -> &[u8] {
+    pub fn suffix(&self) -> Result<&[u8], ReaderError> {
         self.data
             .get(..self.header.name_len as usize)
-            .unwrap_or(&[])
+            .ok_or(ReaderError::OutOfBounds)
     }
 
     /// Returns the attribute value
-    pub fn value(&self) -> &[u8] {
+    pub fn value(&self) -> Result<&[u8], ReaderError> {
         let name_len = self.header.name_len as usize;
         let value_size = self.header.value_size.get() as usize;
         self.data
             .get(name_len..name_len + value_size)
-            .unwrap_or(&[])
+            .ok_or(ReaderError::OutOfBounds)
     }
 
     /// Returns the padding bytes after the value
-    pub fn padding(&self) -> &[u8] {
+    pub fn padding(&self) -> Result<&[u8], ReaderError> {
         let end = self.header.name_len as usize + self.header.value_size.get() as usize;
-        self.data.get(end..).unwrap_or(&[])
+        self.data.get(end..).ok_or(ReaderError::OutOfBounds)
     }
 }
 
@@ -618,6 +624,33 @@ impl<'img> Image<'img> {
     pub fn root(&self) -> Result<InodeType<'_>, ReaderError> {
         self.inode(self.sb.root_nid.get() as u64)
     }
+
+    /// Finds a child directory entry by name within a directory inode.
+    ///
+    /// Returns the nid (inode number) of the child if found.
+    pub fn find_child_nid(&self, parent_nid: u64, name: &[u8]) -> Result<Option<u64>, ReaderError> {
+        let inode = self.inode(parent_nid)?;
+        if let Some(inline) = inode.inline() {
+            if let Ok(block) = DirectoryBlock::ref_from_bytes(inline) {
+                for entry in block.entries() {
+                    let entry = entry?;
+                    if entry.name == name {
+                        return Ok(Some(entry.nid()));
+                    }
+                }
+            }
+        }
+        for blkid in inode.blocks(self.blkszbits)? {
+            let block = self.directory_block(blkid)?;
+            for entry in block.entries() {
+                let entry = entry?;
+                if entry.name == name {
+                    return Ok(Some(entry.nid()));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 // TODO: there must be an easier way...
@@ -864,27 +897,28 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for ObjectCollector<'_, Object
 }
 
 impl<ObjectID: FsVerityHashValue> ObjectCollector<'_, ObjectID> {
-    fn visit_xattr(&mut self, attr: &XAttr) {
+    fn visit_xattr(&mut self, attr: &XAttr) -> Result<(), ReaderError> {
         // This is the index of "trusted".  See XATTR_PREFIXES in format.rs.
         if attr.header.name_index != 4 {
-            return;
+            return Ok(());
         }
-        if attr.suffix() != b"overlay.metacopy" {
-            return;
+        if attr.suffix()? != b"overlay.metacopy" {
+            return Ok(());
         }
-        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()) {
+        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()?) {
             if value.valid() {
                 self.objects.insert(value.digest);
             }
         }
+        Ok(())
     }
 
     fn visit_xattrs(&mut self, img: &Image, xattrs: &InodeXAttrs) -> ReadResult<()> {
         for id in xattrs.shared()? {
-            self.visit_xattr(img.shared_xattr(id.get())?);
+            self.visit_xattr(img.shared_xattr(id.get())?)?;
         }
         for attr in xattrs.local() {
-            self.visit_xattr(attr?);
+            self.visit_xattr(attr?)?;
         }
         Ok(())
     }
@@ -985,7 +1019,7 @@ fn construct_xattr_name(xattr: &XAttr) -> Result<Vec<u8>, ReaderError> {
                 xattr.header.name_index
             ))
         })?;
-    let suffix = xattr.suffix();
+    let suffix = xattr.suffix()?;
     let mut full_name = Vec::with_capacity(prefix.len() + suffix.len());
     full_name.extend_from_slice(prefix);
     full_name.extend_from_slice(suffix);
@@ -1105,7 +1139,7 @@ fn transform_xattr(xattr: &XAttr) -> anyhow::Result<Option<(Box<OsStr>, Box<[u8]
             let mut unescaped = b"trusted.overlay.".to_vec();
             unescaped.extend_from_slice(rest);
             let name = Box::from(OsStr::from_bytes(&unescaped));
-            let value = Box::from(xattr.value());
+            let value = Box::from(xattr.value()?);
             return Ok(Some((name, value)));
         }
         // Skip all other trusted.overlay.* xattrs (internal to composefs)
@@ -1114,7 +1148,7 @@ fn transform_xattr(xattr: &XAttr) -> anyhow::Result<Option<(Box<OsStr>, Box<[u8]
 
     // Keep all non-trusted.overlay.* xattrs
     let name = Box::from(OsStr::from_bytes(&full_name));
-    let value = Box::from(xattr.value());
+    let value = Box::from(xattr.value()?);
     Ok(Some((name, value)))
 }
 
@@ -1175,10 +1209,10 @@ fn check_metacopy_xattr<ObjectID: FsVerityHashValue>(
     if xattr.header.name_index != 4 {
         return Ok(None);
     }
-    if xattr.suffix() != b"overlay.metacopy" {
+    if xattr.suffix()? != b"overlay.metacopy" {
         return Ok(None);
     }
-    if let Ok(value) = OverlayMetacopy::<ObjectID>::read_from_bytes(xattr.value()) {
+    if let Ok(value) = OverlayMetacopy::<ObjectID>::read_from_bytes(xattr.value()?) {
         if value.valid() {
             return Ok(Some(value.digest.clone()));
         }
@@ -1541,39 +1575,22 @@ mod tests {
         let root_nid = img.sb.root_nid.get() as u64;
         validate_directory_entries(&img, root_nid, &[".", "..", "a"]);
 
-        // Helper to find a directory entry by name
-        let find_entry = |parent_nid: u64, name: &[u8]| -> u64 {
-            let inode = img.inode(parent_nid).unwrap();
-
-            if let Some(inline) = inode.inline() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-                for entry in inline_block.entries() {
-                    let entry = entry.unwrap();
-                    if entry.name == name {
-                        return entry.nid();
-                    }
-                }
-            }
-
-            for blkid in inode.blocks(img.blkszbits).unwrap() {
-                let block = img.directory_block(blkid).unwrap();
-                for entry in block.entries() {
-                    let entry = entry.unwrap();
-                    if entry.name == name {
-                        return entry.nid();
-                    }
-                }
-            }
-            panic!("Entry not found: {:?}", std::str::from_utf8(name));
-        };
-
-        let a_nid = find_entry(root_nid, b"a");
+        let a_nid = img
+            .find_child_nid(root_nid, b"a")
+            .unwrap()
+            .expect("a not found");
         validate_directory_entries(&img, a_nid, &[".", "..", "b"]);
 
-        let b_nid = find_entry(a_nid, b"b");
+        let b_nid = img
+            .find_child_nid(a_nid, b"b")
+            .unwrap()
+            .expect("b not found");
         validate_directory_entries(&img, b_nid, &[".", "..", "c"]);
 
-        let c_nid = find_entry(b_nid, b"c");
+        let c_nid = img
+            .find_child_nid(b_nid, b"c")
+            .unwrap()
+            .expect("c not found");
         validate_directory_entries(&img, c_nid, &[".", "..", "file.txt"]);
     }
 
@@ -1750,6 +1767,7 @@ mod tests {
         let inline_data = file1_inode.inline();
         assert_eq!(inline_data, Some(b"hello".as_slice()));
     }
+
     /// Helper: round-trip a dumpfile through erofs and compare the result.
     fn round_trip_dumpfile(input: &str) -> (String, String) {
         let fs_orig = dumpfile_to_filesystem::<Sha256HashValue>(input).unwrap();
