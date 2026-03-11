@@ -44,8 +44,20 @@ pub trait InodeHeader {
     fn size(&self) -> u64;
     /// Returns the union field value (block address, device number, etc.)
     fn u(&self) -> u32;
+    /// Returns the user ID
+    fn uid(&self) -> u32;
+    /// Returns the group ID
+    fn gid(&self) -> u32;
     /// Returns the number of hard links
     fn nlink(&self) -> u32;
+    /// Returns the modification time in seconds since epoch
+    fn mtime(&self) -> i64;
+    /// Returns the modification time nanoseconds component
+    fn mtime_nsec(&self) -> u32;
+    /// Returns the device number (for block/character devices, from the `u` field)
+    fn rdev(&self) -> u32 {
+        self.u()
+    }
 
     /// Calculates the number of additional bytes after the header
     fn additional_bytes(&self, blkszbits: u8) -> usize {
@@ -88,8 +100,24 @@ impl InodeHeader for ExtendedInodeHeader {
         self.u.get()
     }
 
+    fn uid(&self) -> u32 {
+        self.uid.get()
+    }
+
+    fn gid(&self) -> u32 {
+        self.gid.get()
+    }
+
     fn nlink(&self) -> u32 {
         self.nlink.get()
+    }
+
+    fn mtime(&self) -> i64 {
+        self.mtime.get() as i64
+    }
+
+    fn mtime_nsec(&self) -> u32 {
+        self.mtime_nsec.get()
     }
 }
 
@@ -114,8 +142,26 @@ impl InodeHeader for CompactInodeHeader {
         self.u.get()
     }
 
+    fn uid(&self) -> u32 {
+        self.uid.get() as u32
+    }
+
+    fn gid(&self) -> u32 {
+        self.gid.get() as u32
+    }
+
     fn nlink(&self) -> u32 {
-        self.nlink.get().into()
+        self.nlink.get() as u32
+    }
+
+    fn mtime(&self) -> i64 {
+        // Compact inodes don't have mtime; return 0
+        0
+    }
+
+    fn mtime_nsec(&self) -> u32 {
+        // Compact inodes don't have mtime_nsec; return 0
+        0
     }
 }
 
@@ -150,7 +196,7 @@ pub struct InodeXAttrs {
 }
 
 impl XAttrHeader {
-    /// Calculates the total size of this xattr including padding
+    /// Calculates the total number of elements for an xattr entry including padding
     pub fn calculate_n_elems(&self) -> usize {
         round_up(self.name_len as usize + self.value_size.get() as usize, 4)
     }
@@ -210,8 +256,24 @@ impl<Header: InodeHeader> InodeHeader for &Inode<Header> {
         self.header.u()
     }
 
+    fn uid(&self) -> u32 {
+        self.header.uid()
+    }
+
+    fn gid(&self) -> u32 {
+        self.header.gid()
+    }
+
     fn nlink(&self) -> u32 {
         self.header.nlink()
+    }
+
+    fn mtime(&self) -> i64 {
+        self.header.mtime()
+    }
+
+    fn mtime_nsec(&self) -> u32 {
+        self.header.mtime_nsec()
     }
 }
 
@@ -299,10 +361,38 @@ impl InodeHeader for InodeType<'_> {
         }
     }
 
+    fn uid(&self) -> u32 {
+        match self {
+            Self::Compact(inode) => inode.uid(),
+            Self::Extended(inode) => inode.uid(),
+        }
+    }
+
+    fn gid(&self) -> u32 {
+        match self {
+            Self::Compact(inode) => inode.gid(),
+            Self::Extended(inode) => inode.gid(),
+        }
+    }
+
     fn nlink(&self) -> u32 {
         match self {
             Self::Compact(inode) => inode.nlink(),
             Self::Extended(inode) => inode.nlink(),
+        }
+    }
+
+    fn mtime(&self) -> i64 {
+        match self {
+            Self::Compact(inode) => inode.mtime(),
+            Self::Extended(inode) => inode.mtime(),
+        }
+    }
+
+    fn mtime_nsec(&self) -> u32 {
+        match self {
+            Self::Compact(inode) => inode.mtime_nsec(),
+            Self::Extended(inode) => inode.mtime_nsec(),
         }
     }
 }
@@ -528,7 +618,8 @@ pub struct DirectoryEntry<'a> {
 }
 
 impl DirectoryEntry<'_> {
-    fn nid(&self) -> u64 {
+    /// Returns the inode number (nid) for this directory entry.
+    pub fn nid(&self) -> u64 {
         self.header.inode_offset.get()
     }
 }
@@ -590,14 +681,29 @@ pub enum ErofsReaderError {
 type ReadResult<T> = Result<T, ErofsReaderError>;
 
 /// Collects object references from an EROFS image for garbage collection
-#[derive(Debug)]
-pub struct ObjectCollector<ObjectID: FsVerityHashValue> {
+pub struct ObjectCollector<'f, ObjectID: FsVerityHashValue> {
     visited_nids: HashSet<u64>,
     nids_to_visit: BTreeSet<u64>,
     objects: HashSet<ObjectID>,
+    /// Optional filters for top-level entries
+    filters: &'f [String],
+    /// Whether we're currently at the root directory
+    at_root: bool,
 }
 
-impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
+impl<ObjectID: FsVerityHashValue> std::fmt::Debug for ObjectCollector<'_, ObjectID> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectCollector")
+            .field("visited_nids", &self.visited_nids)
+            .field("nids_to_visit", &self.nids_to_visit)
+            .field("objects_count", &self.objects.len())
+            .field("filters", &self.filters)
+            .field("at_root", &self.at_root)
+            .finish()
+    }
+}
+
+impl<ObjectID: FsVerityHashValue> ObjectCollector<'_, ObjectID> {
     fn visit_xattr(&mut self, attr: &XAttr) {
         // This is the index of "trusted".  See XATTR_PREFIXES in format.rs.
         if attr.header.name_index != 4 {
@@ -623,9 +729,17 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
         Ok(())
     }
 
-    fn visit_directory_block(&mut self, block: &DirectoryBlock) {
+    fn visit_directory_block(&mut self, block: &DirectoryBlock, apply_filter: bool) {
         for entry in block.entries() {
             if entry.name != b"." && entry.name != b".." {
+                // Apply filter at root level if filters are specified
+                if apply_filter && !self.filters.is_empty() {
+                    let name_str = String::from_utf8_lossy(entry.name);
+                    if !self.filters.iter().any(|f| f == name_str.as_ref()) {
+                        continue;
+                    }
+                }
+
                 let nid = entry.nid();
                 if !self.visited_nids.contains(&nid) {
                     self.nids_to_visit.insert(nid);
@@ -645,13 +759,18 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
         }
 
         if inode.mode().is_dir() {
+            // Apply filters only when visiting the root directory
+            let apply_filter = self.at_root;
+            self.at_root = false;
+
             for blkid in inode.blocks(img.sb.blkszbits) {
-                self.visit_directory_block(img.directory_block(blkid));
+                self.visit_directory_block(img.directory_block(blkid), apply_filter);
             }
 
             if let Some(inline) = inode.inline() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-                self.visit_directory_block(inline_block);
+                if let Ok(inline_block) = DirectoryBlock::ref_from_bytes(inline) {
+                    self.visit_directory_block(inline_block, apply_filter);
+                }
             }
         }
 
@@ -664,13 +783,21 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
 /// This function walks the directory tree and extracts fsverity object IDs
 /// from overlay.metacopy xattrs for garbage collection purposes.
 ///
+/// If `filters` is provided and non-empty, only top-level entries whose names
+/// match one of the filter strings will be traversed.
+///
 /// Returns a set of all referenced object IDs.
-pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<HashSet<ObjectID>> {
+pub fn collect_objects<ObjectID: FsVerityHashValue>(
+    image: &[u8],
+    filters: &[String],
+) -> ReadResult<HashSet<ObjectID>> {
     let img = Image::open(image);
     let mut this = ObjectCollector {
         visited_nids: HashSet::new(),
         nids_to_visit: BTreeSet::new(),
         objects: HashSet::new(),
+        filters,
+        at_root: true,
     };
 
     // nids_to_visit is initialized with the root directory.  Visiting directory nids will add
@@ -692,20 +819,49 @@ fn construct_xattr_name(xattr: &XAttr) -> Vec<u8> {
     full_name
 }
 
+/// The xattr that marks an overlay whiteout stored as a regular file.
+const OVERLAY_XATTR_ESCAPED_WHITEOUT: &[u8] = b"trusted.overlay.overlay.whiteout";
+
+/// Checks if an inode has the escaped whiteout xattr (`trusted.overlay.overlay.whiteout`).
+/// These regular files need to be transformed back into character device whiteouts.
+fn has_escaped_whiteout_xattr(img: &Image, inode: &InodeType) -> bool {
+    let Some(xattrs_section) = inode.xattrs() else {
+        return false;
+    };
+
+    for xattr in xattrs_section.local() {
+        let full_name = construct_xattr_name(xattr);
+        if full_name == OVERLAY_XATTR_ESCAPED_WHITEOUT {
+            return true;
+        }
+    }
+
+    for id in xattrs_section.shared() {
+        let xattr = img.shared_xattr(id.get());
+        let full_name = construct_xattr_name(xattr);
+        if full_name == OVERLAY_XATTR_ESCAPED_WHITEOUT {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Build a `tree::Stat` from an erofs inode, reversing the xattr namespace
 /// transformations applied by the writer:
-/// - Strips `trusted.overlay.metacopy` and `trusted.overlay.redirect`
+/// - Strips `trusted.overlay.metacopy`, `trusted.overlay.redirect`, and whiteout markers
+/// - Strips all other internal `trusted.overlay.*` xattrs (e.g. opaque)
 /// - Unescapes `trusted.overlay.overlay.X` back to `trusted.overlay.X`
+/// - Uses superblock `build_time` for compact inode mtimes
 fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> tree::Stat {
     let (st_mode, st_uid, st_gid, st_mtim_sec) = match inode {
         InodeType::Compact(inode) => (
             inode.header.mode.0.get() as u32 & 0o7777,
             inode.header.uid.get() as u32,
             inode.header.gid.get() as u32,
-            // Compact inodes don't store mtime; the writer uses build_time
-            // but for round-trip purposes, 0 matches what was written for
-            // compact headers (the writer always uses ExtendedInodeHeader)
-            0i64,
+            // Compact inodes don't store mtime; use build_time from superblock
+            // to match dump.rs behavior
+            img.sb.build_time.get() as i64,
         ),
         InodeType::Extended(inode) => (
             inode.header.mode.0.get() as u32 & 0o7777,
@@ -744,24 +900,44 @@ fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> tree::Stat {
 
 /// Transform a single xattr, reversing writer escaping.
 /// Returns None for internal overlay xattrs that should be stripped.
+///
+/// The stripping logic matches `dump.rs` behavior:
+/// 1. Skip `trusted.overlay.metacopy` and `trusted.overlay.redirect` (internal markers)
+/// 2. Skip whiteout-related xattrs (escaped whiteout, userxattr whiteout variants)
+/// 3. For remaining `trusted.overlay.*`: unescape `trusted.overlay.overlay.X` → `trusted.overlay.X`,
+///    skip anything else (e.g. `trusted.overlay.opaque`)
+/// 4. Keep all non-`trusted.overlay.*` xattrs unchanged
 fn transform_xattr(xattr: &XAttr) -> Option<(Box<OsStr>, Box<[u8]>)> {
     let full_name = construct_xattr_name(xattr);
 
-    // Skip internal overlay xattrs added by the writer
-    if full_name == b"trusted.overlay.metacopy" || full_name == b"trusted.overlay.redirect" {
+    // Skip internal composefs xattrs that should never appear in output
+    if full_name == b"trusted.overlay.metacopy"
+        || full_name == b"trusted.overlay.redirect"
+        || full_name == b"trusted.overlay.overlay.whiteout"
+        || full_name == b"trusted.overlay.overlay.whiteouts"
+        || full_name == b"trusted.overlay.userxattr.whiteout"
+        || full_name == b"trusted.overlay.userxattr.whiteouts"
+        || full_name == b"user.overlay.whiteout"
+        || full_name == b"user.overlay.whiteouts"
+    {
         return None;
     }
 
-    // Unescape: trusted.overlay.overlay.X -> trusted.overlay.X
-    let final_name = if let Some(rest) = full_name.strip_prefix(b"trusted.overlay.overlay.") {
-        let mut unescaped = b"trusted.overlay.".to_vec();
-        unescaped.extend_from_slice(rest);
-        unescaped
-    } else {
-        full_name
-    };
+    if full_name.starts_with(b"trusted.overlay.") {
+        // Unescape: trusted.overlay.overlay.X -> trusted.overlay.X
+        if let Some(rest) = full_name.strip_prefix(b"trusted.overlay.overlay.") {
+            let mut unescaped = b"trusted.overlay.".to_vec();
+            unescaped.extend_from_slice(rest);
+            let name = Box::from(OsStr::from_bytes(&unescaped));
+            let value = Box::from(xattr.value());
+            return Some((name, value));
+        }
+        // Skip all other trusted.overlay.* xattrs (internal to composefs)
+        return None;
+    }
 
-    let name = Box::from(OsStr::from_bytes(&final_name));
+    // Keep all non-trusted.overlay.* xattrs
+    let name = Box::from(OsStr::from_bytes(&full_name));
     let value = Box::from(xattr.value());
     Some((name, value))
 }
@@ -858,6 +1034,14 @@ fn dir_entries<'a>(
 }
 
 /// Recursively populate a `tree::Directory` from an erofs directory inode.
+///
+/// Whiteout handling (matching `dump.rs` behavior):
+/// - Character device inodes with rdev=0 are whiteout entries and are skipped entirely
+/// - Regular files with `trusted.overlay.overlay.whiteout` xattr are "escaped whiteouts"
+///   and are transformed back to `CharacterDevice(0)` entries
+///
+/// Xattr stripping: internal overlay xattrs (metacopy, redirect, whiteout markers,
+/// opaque, etc.) are stripped via `transform_xattr`.
 fn populate_directory<ObjectID: FsVerityHashValue>(
     img: &Image,
     dir_inode: &InodeType,
@@ -867,6 +1051,11 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
     for (name_bytes, nid) in dir_entries(img, dir_inode) {
         let name = OsStr::from_bytes(name_bytes);
         let child_inode = img.inode(nid);
+
+        // Skip whiteout entries (character device with rdev=0)
+        if (child_inode.mode().0.get() & S_IFMT) == S_IFCHR && child_inode.rdev() == 0 {
+            continue;
+        }
 
         if child_inode.mode().is_dir() {
             let child_stat = stat_from_inode_for_tree(img, &child_inode);
@@ -881,32 +1070,46 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                 continue;
             }
 
-            let stat = stat_from_inode_for_tree(img, &child_inode);
-            let mode = child_inode.mode().0.get();
-            let file_type = mode & S_IFMT;
+            // Check for escaped whiteout before building stat (the xattr will be
+            // stripped by transform_xattr, so we must check the raw inode first)
+            let is_escaped_whiteout = {
+                let mode = child_inode.mode().0.get();
+                (mode & S_IFMT) == S_IFREG && has_escaped_whiteout_xattr(img, &child_inode)
+            };
 
-            let content = match file_type {
-                S_IFREG => {
-                    if let Some(digest) = extract_metacopy_digest::<ObjectID>(img, &child_inode) {
-                        tree::LeafContent::Regular(tree::RegularFile::External(
-                            digest,
-                            child_inode.size(),
-                        ))
-                    } else {
-                        let data = extract_all_file_data(img, &child_inode);
-                        tree::LeafContent::Regular(tree::RegularFile::Inline(data.into()))
+            let stat = stat_from_inode_for_tree(img, &child_inode);
+
+            let content = if is_escaped_whiteout {
+                // Transform escaped whiteout back to character device with rdev=0
+                tree::LeafContent::CharacterDevice(0)
+            } else {
+                let mode = child_inode.mode().0.get();
+                let file_type = mode & S_IFMT;
+
+                match file_type {
+                    S_IFREG => {
+                        if let Some(digest) = extract_metacopy_digest::<ObjectID>(img, &child_inode)
+                        {
+                            tree::LeafContent::Regular(tree::RegularFile::External(
+                                digest,
+                                child_inode.size(),
+                            ))
+                        } else {
+                            let data = extract_all_file_data(img, &child_inode);
+                            tree::LeafContent::Regular(tree::RegularFile::Inline(data.into()))
+                        }
                     }
+                    S_IFLNK => {
+                        let target_data = extract_all_file_data(img, &child_inode);
+                        let target = OsStr::from_bytes(&target_data);
+                        tree::LeafContent::Symlink(Box::from(target))
+                    }
+                    S_IFBLK => tree::LeafContent::BlockDevice(child_inode.u() as u64),
+                    S_IFCHR => tree::LeafContent::CharacterDevice(child_inode.u() as u64),
+                    S_IFIFO => tree::LeafContent::Fifo,
+                    S_IFSOCK => tree::LeafContent::Socket,
+                    _ => anyhow::bail!("unknown file type {:#o} for {:?}", file_type, name),
                 }
-                S_IFLNK => {
-                    let target_data = child_inode.inline().unwrap_or(&[]);
-                    let target = OsStr::from_bytes(target_data);
-                    tree::LeafContent::Symlink(Box::from(target))
-                }
-                S_IFBLK => tree::LeafContent::BlockDevice(child_inode.u() as u64),
-                S_IFCHR => tree::LeafContent::CharacterDevice(child_inode.u() as u64),
-                S_IFIFO => tree::LeafContent::Fifo,
-                S_IFSOCK => tree::LeafContent::Socket,
-                _ => anyhow::bail!("unknown file type {:#o} for {:?}", file_type, name),
             };
 
             let leaf = Rc::new(tree::Leaf { stat, content });
@@ -951,7 +1154,7 @@ mod tests {
     use super::*;
     use crate::{
         dumpfile::{dumpfile_to_filesystem, write_dumpfile},
-        erofs::writer::mkfs_erofs,
+        erofs::writer::mkfs_erofs_default,
         fsverity::Sha256HashValue,
     };
     use std::collections::HashMap;
@@ -1000,7 +1203,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         // Root should have . and .. and empty_dir
@@ -1043,7 +1246,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         // Find dir1
@@ -1086,7 +1289,7 @@ mod tests {
         }
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(&dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         // Find bigdir
@@ -1134,7 +1337,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         // Navigate through the structure
@@ -1187,7 +1390,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         let root_inode = img.root();
@@ -1231,10 +1434,10 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
 
         // This should traverse all directories without error
-        let result = collect_objects::<Sha256HashValue>(&image);
+        let result = collect_objects::<Sha256HashValue>(&image, &[]);
         assert!(
             result.is_ok(),
             "Failed to collect objects: {:?}",
@@ -1290,7 +1493,7 @@ mod tests {
         let image = std::fs::read(&erofs_path).expect("Failed to read generated erofs");
 
         // The C mkcomposefs creates directories with empty inline sections.
-        let r = collect_objects::<Sha256HashValue>(&image).unwrap();
+        let r = collect_objects::<Sha256HashValue>(&image, &[]).unwrap();
         assert_eq!(r.len(), 0);
 
         Ok(())
@@ -1307,7 +1510,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         // Verify root entries
@@ -1352,7 +1555,7 @@ mod tests {
         write_dumpfile(&mut orig_output, &fs_orig).unwrap();
         let orig_str = String::from_utf8(orig_output).unwrap();
 
-        let image = mkfs_erofs(&fs_orig);
+        let image = mkfs_erofs_default(&fs_orig);
         let fs_rt = erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
 
         let mut rt_output = Vec::new();
@@ -1454,7 +1657,7 @@ mod tests {
 "#;
 
         let fs_orig = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs_orig);
+        let image = mkfs_erofs_default(&fs_orig);
         let fs_rt = erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
 
         // Verify hardlink Rc sharing (scope the extra refs so strong_count
@@ -1508,7 +1711,7 @@ mod tests {
             let mut orig_output = Vec::new();
             write_dumpfile(&mut orig_output, fs_orig).unwrap();
 
-            let image = mkfs_erofs(fs_orig);
+            let image = mkfs_erofs_default(fs_orig);
             let fs_rt = erofs_to_filesystem::<ObjectID>(&image).unwrap();
 
             let mut rt_output = Vec::new();
