@@ -1026,6 +1026,10 @@ fn construct_xattr_name(xattr: &XAttr) -> Result<Vec<u8>, ReaderError> {
     Ok(full_name)
 }
 
+/// Maximum directory nesting depth. PATH_MAX is 4096 on Linux, and directory names
+/// must be at least 2 bytes (1 char + separator), so the theoretical max is PATH_MAX / 2.
+const MAX_DIRECTORY_DEPTH: usize = 4096 / 2;
+
 /// The xattr that marks an overlay whiteout stored as a regular file.
 const OVERLAY_XATTR_ESCAPED_WHITEOUT: &[u8] = b"trusted.overlay.overlay.whiteout";
 
@@ -1268,7 +1272,12 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
     dir_inode: &InodeType,
     dir: &mut tree::Directory<ObjectID>,
     hardlinks: &mut HashMap<u64, Rc<tree::Leaf<ObjectID>>>,
+    depth: usize,
 ) -> anyhow::Result<()> {
+    if depth >= MAX_DIRECTORY_DEPTH {
+        return Err(ErofsReaderError::DepthExceeded.into());
+    }
+
     for (name_bytes, nid) in dir_entries(img, dir_inode)? {
         let name = OsStr::from_bytes(name_bytes);
         let child_inode = img.inode(nid)?;
@@ -1281,7 +1290,7 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
         if child_inode.mode().is_dir() {
             let child_stat = stat_from_inode_for_tree(img, &child_inode)?;
             let mut child_dir = tree::Directory::new(child_stat);
-            populate_directory(img, &child_inode, &mut child_dir, hardlinks)
+            populate_directory(img, &child_inode, &mut child_dir, hardlinks, depth + 1)
                 .with_context(|| format!("reading directory {:?}", name))?;
             dir.insert(name, tree::Inode::Directory(Box::new(child_dir)));
         } else {
@@ -1365,7 +1374,7 @@ pub fn erofs_to_filesystem<ObjectID: FsVerityHashValue>(
 
     let mut hardlinks: HashMap<u64, Rc<tree::Leaf<ObjectID>>> = HashMap::new();
 
-    populate_directory(&img, &root_inode, &mut fs.root, &mut hardlinks)
+    populate_directory(&img, &root_inode, &mut fs.root, &mut hardlinks, 0)
         .context("reading root directory")?;
 
     Ok(fs)
