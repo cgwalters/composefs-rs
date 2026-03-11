@@ -271,8 +271,8 @@ impl std::ops::BitOr<u32> for FileType {
 
 /// EROFS format version number
 pub const VERSION: U32 = U32::new(1);
-/// Composefs-specific version number
-pub const COMPOSEFS_VERSION: U32 = U32::new(2);
+/// Composefs-specific version number for Format 1.1 (extended inodes, no whiteout table)
+pub const COMPOSEFS_VERSION_V1_1: U32 = U32::new(2);
 /// Composefs-specific version number for Format 1.0 (compact inodes, whiteout table)
 pub const COMPOSEFS_VERSION_V1_0: U32 = U32::new(0);
 /// Magic number identifying composefs images
@@ -301,7 +301,7 @@ impl FormatVersion {
     pub fn composefs_version(self) -> U32 {
         match self {
             FormatVersion::V1_0 => COMPOSEFS_VERSION_V1_0,
-            FormatVersion::V1_1 => COMPOSEFS_VERSION,
+            FormatVersion::V1_1 => COMPOSEFS_VERSION_V1_1,
         }
     }
 }
