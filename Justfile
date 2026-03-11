@@ -51,9 +51,13 @@ cfsctl_features := env("COMPOSEFS_CFSCTL_FEATURES", "pre-6.15")
 # Derive test image name from base_image
 _test_image := if base_image =~ "debian" { "localhost/composefs-rs-test-debian:latest" } else if base_image =~ "stream9" { "localhost/composefs-rs-test-c9s:latest" } else { "localhost/composefs-rs-test:latest" }
 
-# Run unprivileged integration tests against the cfsctl binary (no root, no VM)
-test-integration: build
-    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests -- --skip privileged_
+# Run integration tests (builds cfsctl first); pass extra args to the harness
+test-integration *ARGS: build
+    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests --bin cfsctl-integration-tests -- {{ ARGS }}
+
+# Run only the fast unprivileged integration tests (no root, no VM)
+integration-unprivileged: build
+    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests --bin cfsctl-integration-tests -- --skip privileged_
 
 # Build the test container image for VM-based integration tests
 _integration-container-build:
@@ -63,7 +67,19 @@ _integration-container-build:
 test-integration-vm: build _integration-container-build
     COMPOSEFS_TEST_IMAGE={{_test_image}} \
         CFSCTL_PATH=$(pwd)/target/debug/cfsctl \
-        cargo run -p integration-tests
+        cargo run -p integration-tests --bin cfsctl-integration-tests
+
+# Run all tests with all features enabled
+test-all:
+    cargo test --workspace --all-features
+
+# Build with containers-storage feature
+build-cstorage:
+    cargo build --workspace --features containers-storage
+
+# Run integration tests (requires podman and skopeo)
+integration-test: build-release
+    CFSCTL_PATH=$(pwd)/target/release/cfsctl cargo run --release -p integration-tests --bin cfsctl-integration-tests
 
 # Run everything: checks + full integration tests including VM
 ci: check test-integration-vm
