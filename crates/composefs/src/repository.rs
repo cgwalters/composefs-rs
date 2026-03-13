@@ -904,6 +904,7 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     /// written before #[repr(C)] was added to SplitstreamHeader.
     #[cfg(any(test, feature = "test"))]
     write_old_splitstream_format: std::sync::atomic::AtomicBool,
+    privileged: bool,
     _data: std::marker::PhantomData<ObjectID>,
 }
 
@@ -913,6 +914,7 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for Repository<ObjectID> {
             .field("repository", &self.repository)
             .field("objects", &self.objects)
             .field("insecure", &self.insecure)
+            .field("privileged", &self.privileged)
             .finish_non_exhaustive()
     }
 }
@@ -1382,6 +1384,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             erofs_version_override: None,
             #[cfg(any(test, feature = "test"))]
             write_old_splitstream_format: std::sync::atomic::AtomicBool::new(false),
+            privileged: true,
             _data: std::marker::PhantomData,
         })
     }
@@ -2146,6 +2149,25 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(WritableRepo)
     }
 
+    /// Sets whether this repository operates in privileged mode.
+    ///
+    /// In privileged mode (default), kernel EROFS mounting and the `.fs-verity`
+    /// keyring are available. In unprivileged mode, callers should use FUSE
+    /// mounting with userspace verification instead.
+    ///
+    /// This is orthogonal to `insecure`: `insecure` controls whether fsverity
+    /// is available on the filesystem, while `privileged` controls whether
+    /// kernel mounting capabilities are available.
+    pub fn set_privileged(&mut self, privileged: bool) -> &mut Self {
+        self.privileged = privileged;
+        self
+    }
+
+    /// Returns whether this repository is in privileged mode.
+    pub fn is_privileged(&self) -> bool {
+        self.privileged
+    }
+
     /// Creates a SplitStreamWriter for writing a split stream.
     /// You should write the data to the returned object and then pass it to .store_stream() to
     /// store the result.
@@ -2504,6 +2526,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// be attached via e.g. `move_mount`.
     #[context("Mounting image '{name}'")]
     pub fn mount(&self, name: &str) -> Result<OwnedFd> {
+        ensure!(
+            self.privileged,
+            "kernel mounting requires privileged mode; use FUSE mounting for unprivileged operation"
+        );
+
         let (image, enable_verity) = self.open_image(name)?;
 
         composefs_fsmount(
@@ -5896,5 +5923,27 @@ mod tests {
             "named ref must NOT point to V2 image, but points to: {target_str}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_privileged_flag() {
+        let tmp = tempdir();
+        let (mut repo, _) = Repository::<Sha512HashValue>::init_path(
+            CWD,
+            tmp.path(),
+            RepositoryConfig::new(Algorithm::SHA512).set_insecure(),
+        )
+        .unwrap();
+
+        // Default is privileged
+        assert!(repo.is_privileged());
+
+        // Can disable
+        repo.set_privileged(false);
+        assert!(!repo.is_privileged());
+
+        // Can re-enable
+        repo.set_privileged(true);
+        assert!(repo.is_privileged());
     }
 }
