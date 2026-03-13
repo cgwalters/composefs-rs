@@ -28,6 +28,7 @@ containers-image-proxy = { version = "0.10", default-features = false }
 cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.4.0", optional = true }
 hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.17.0", default-features = false }
+openssl = "0.10"
 rustix = { version = "1.0.0", features = ["fs"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 thiserror = { version = "2.0.0", default-features = false }
