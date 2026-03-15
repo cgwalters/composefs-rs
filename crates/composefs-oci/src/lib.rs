@@ -14,6 +14,8 @@
 pub mod boot;
 pub mod image;
 pub mod oci_image;
+#[cfg(feature = "oci-client")]
+pub mod referrers;
 pub mod signature;
 pub mod signing;
 pub mod skopeo;
@@ -28,7 +30,7 @@ pub mod test_util;
 // Re-export the composefs crate for consumers who only need composefs-oci
 pub use composefs;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};
 use containers_image_proxy::ImageProxyConfig;
@@ -419,7 +421,7 @@ fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
     // Rewrite config with the EROFS image ref, using layer refs from the
     // OciImage (which already stripped the old image ref if any).
     // Preserve any existing boot image ref.
-    let (_config_digest, new_config_verity) = write_config(
+    let (new_config_digest, new_config_verity) = write_config(
         repo,
         &config,
         img.layer_refs().clone(),
@@ -427,20 +429,52 @@ fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
         img.boot_image_ref(),
     )?;
 
-    // Read original manifest JSON for rewriting
-    let manifest_json = img.read_manifest_json(repo)?;
+    // Build a new manifest with the updated config digest. The config content
+    // may have been re-serialized differently from the original registry bytes,
+    // so the sha256 digest can change. We must build a fresh manifest that
+    // references the correct config digest.
+    let new_config_json = {
+        let config_id = crate::config_identifier(&new_config_digest);
+        let (data, _) = oci_image::read_external_splitstream(
+            repo,
+            &config_id,
+            Some(&new_config_verity),
+            Some(crate::skopeo::OCI_CONFIG_CONTENT_TYPE),
+        )?;
+        data
+    };
 
-    // Rewrite manifest with updated config verity, preserving layer verities.
-    // The layer_refs from OciImage are the same as the manifest's layer refs
-    // (both ultimately come from the config's diff_id → verity map).
-    let layer_verities = img.layer_refs().clone();
+    let new_config_descriptor = oci_spec::image::DescriptorBuilder::default()
+        .media_type(oci_spec::image::MediaType::ImageConfig)
+        .digest(
+            oci_spec::image::Digest::from_str(&new_config_digest)
+                .context("parsing config digest")?,
+        )
+        .size(new_config_json.len() as u64)
+        .build()
+        .context("building config descriptor")?;
 
-    let (_new_manifest_digest, _new_manifest_verity) = oci_image::rewrite_manifest(
+    let new_manifest = oci_spec::image::ImageManifestBuilder::default()
+        .schema_version(2u32)
+        .media_type(oci_spec::image::MediaType::ImageManifest)
+        .config(new_config_descriptor)
+        .layers(img.manifest().layers().to_vec())
+        .build()
+        .context("building manifest with updated config")?;
+
+    let new_manifest_json = new_manifest.to_string()?;
+    let new_manifest_digest = hash(new_manifest_json.as_bytes());
+
+    // Use rewrite_manifest to always update the splitstream, even if the
+    // manifest content hash hasn't changed. The splitstream named refs need
+    // updating to point to the new config verity (which now includes the
+    // EROFS image ref).
+    oci_image::rewrite_manifest(
         repo,
-        &manifest_json,
-        manifest_digest,
+        new_manifest_json.as_bytes(),
+        &new_manifest_digest,
         &new_config_verity,
-        &layer_verities,
+        img.layer_refs(),
         tag,
     )?;
 
@@ -476,7 +510,7 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
     let boot_erofs_id = fs.commit_image(repo, None)?;
 
     // Rewrite config with the boot EROFS image ref, preserving the existing image ref
-    let (_config_digest, new_config_verity) = write_config(
+    let (new_config_digest, new_config_verity) = write_config(
         repo,
         &config,
         img.layer_refs().clone(),
@@ -484,17 +518,45 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
         Some(&boot_erofs_id),
     )?;
 
-    // Read original manifest JSON for rewriting
-    let manifest_json = img.read_manifest_json(repo)?;
+    // Build a new manifest with the updated config digest (same as ensure_oci_composefs_erofs)
+    let new_config_json = {
+        let config_id = crate::config_identifier(&new_config_digest);
+        let (data, _) = oci_image::read_external_splitstream(
+            repo,
+            &config_id,
+            Some(&new_config_verity),
+            Some(crate::skopeo::OCI_CONFIG_CONTENT_TYPE),
+        )?;
+        data
+    };
 
-    let layer_verities = img.layer_refs().clone();
+    let new_config_descriptor = oci_spec::image::DescriptorBuilder::default()
+        .media_type(oci_spec::image::MediaType::ImageConfig)
+        .digest(
+            oci_spec::image::Digest::from_str(&new_config_digest)
+                .context("parsing config digest")?,
+        )
+        .size(new_config_json.len() as u64)
+        .build()
+        .context("building config descriptor")?;
 
-    let (_new_manifest_digest, _new_manifest_verity) = oci_image::rewrite_manifest(
+    let new_manifest = oci_spec::image::ImageManifestBuilder::default()
+        .schema_version(2u32)
+        .media_type(oci_spec::image::MediaType::ImageManifest)
+        .config(new_config_descriptor)
+        .layers(img.manifest().layers().to_vec())
+        .build()
+        .context("building manifest with updated config")?;
+
+    let new_manifest_json = new_manifest.to_string()?;
+    let new_manifest_digest = hash(new_manifest_json.as_bytes());
+
+    oci_image::rewrite_manifest(
         repo,
-        &manifest_json,
-        manifest_digest,
+        new_manifest_json.as_bytes(),
+        &new_manifest_digest,
         &new_config_verity,
-        &layer_verities,
+        img.layer_refs(),
         tag,
     )?;
 
