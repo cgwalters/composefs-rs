@@ -15,6 +15,7 @@ default = ["containers-storage"]
 test = ["tar", "rand", "composefs/test"]
 boot = ["composefs-boot"]
 containers-storage = ["dep:cstorage", "dep:base64", "cstorage/userns-helper"]
+oci-client = ["dep:oci-client"]
 
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
@@ -27,6 +28,9 @@ composefs-boot = { workspace = true, optional = true }
 containers-image-proxy = { version = "0.10", default-features = false }
 cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.4.0", optional = true }
 hex = { version = "0.4.0", default-features = false }
+indicatif = { version = "0.18.0", default-features = false, features = ["tokio"] }
+log = { version = "0.4.8", default-features = false }
+oci-client = { version = "0.16", default-features = false, features = ["rustls-tls"], optional = true }
 openssl = "0.10"
 rustix = { version = "1.0.0", features = ["fs"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
