@@ -61,7 +61,7 @@ impl<ObjectID: FsVerityHashValue> TestRepo<ObjectID> {
     pub fn new() -> Self {
         let dir = tempdir();
         let mut repo = Repository::open_path(CWD, dir.path()).unwrap();
-        repo.set_insecure(true);
+        repo.set_insecure();
         Self {
             repo: Arc::new(repo),
             _tempdir: dir,

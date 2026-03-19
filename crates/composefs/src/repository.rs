@@ -108,9 +108,9 @@ use rustix::{
 
 use crate::{
     fsverity::{
-        compute_verity, enable_verity_maybe_copy, ensure_verity_equal, measure_verity, Algorithm,
-        CompareVerityError, EnableVerityError, FsVerityHashValue, FsVerityHasher,
-        MeasureVerityError,
+        compute_verity, enable_verity_maybe_copy, ensure_verity_equal, measure_verity,
+        measure_verity_opt, Algorithm, CompareVerityError, EnableVerityError, FsVerityHashValue,
+        FsVerityHasher, MeasureVerityError,
     },
     mount::{composefs_fsmount, mount_at},
     splitstream::{SplitStreamReader, SplitStreamWriter},
@@ -326,12 +326,42 @@ pub fn read_repo_metadata(repo_fd: &impl AsFd) -> Result<Option<RepoMetadata>> {
     }
 }
 
+/// Enable fs-verity on an fd, dispatching to the correct hash type
+/// based on the [`Algorithm`].
+fn enable_verity_for_algorithm(
+    dirfd: &impl AsFd,
+    fd: BorrowedFd,
+    algorithm: &Algorithm,
+) -> Result<()> {
+    match algorithm.hash() {
+        "sha256" => {
+            enable_verity_maybe_copy::<crate::fsverity::Sha256HashValue>(dirfd, fd)
+                .context("enabling verity (sha256)")?;
+        }
+        "sha512" => {
+            enable_verity_maybe_copy::<crate::fsverity::Sha512HashValue>(dirfd, fd)
+                .context("enabling verity (sha512)")?;
+        }
+        other => bail!("unsupported hash algorithm '{other}' for verity"),
+    }
+    Ok(())
+}
+
 /// Write `meta.json` into a repository directory fd.
 ///
 /// This atomically writes (via O_TMPFILE + linkat) the metadata file.
 /// It will fail if the file already exists.
+///
+/// If `enable_verity` is true, fs-verity is enabled on `meta.json`
+/// before linking it into place.  This signals to future
+/// [`Repository::open_path`] callers that verity is required on all
+/// objects.
 #[context("Writing repository metadata")]
-pub fn write_repo_metadata(repo_fd: &impl AsFd, meta: &RepoMetadata) -> Result<()> {
+pub fn write_repo_metadata(
+    repo_fd: &impl AsFd,
+    meta: &RepoMetadata,
+    enable_verity: bool,
+) -> Result<()> {
     let data = meta.to_json()?;
 
     // Try O_TMPFILE for atomic creation
@@ -348,6 +378,11 @@ pub fn write_repo_metadata(repo_fd: &impl AsFd, meta: &RepoMetadata) -> Result<(
             file.sync_all().context("syncing metadata tmpfile")?;
 
             let ro_fd = reopen_tmpfile_ro(file).context("re-opening tmpfile read-only")?;
+
+            if enable_verity {
+                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
+                    .context("enabling verity on meta.json")?;
+            }
 
             linkat(
                 CWD,
@@ -372,6 +407,19 @@ pub fn write_repo_metadata(repo_fd: &impl AsFd, meta: &RepoMetadata) -> Result<(
             let mut file = File::from(fd);
             file.write_all(&data).context("writing meta.json")?;
             file.sync_all().context("syncing meta.json to disk")?;
+
+            if enable_verity {
+                let ro_fd = openat(
+                    repo_fd,
+                    REPO_METADATA_FILENAME,
+                    OFlags::RDONLY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .context("re-opening meta.json for verity")?;
+                drop(file);
+                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
+                    .context("enabling verity on meta.json")?;
+            }
         }
         Err(e) => {
             return Err(e).context("creating tmpfile for meta.json")?;
@@ -720,6 +768,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     /// Open a repository at the target directory and path.
+    ///
+    /// The repository's security mode is auto-detected: if `meta.json`
+    /// has fs-verity enabled the repo requires verity on all objects
+    /// (secure mode).  Otherwise the repository operates in insecure
+    /// mode.  Use [`set_insecure`] to override after opening.
     #[context("Opening repository at {}", path.as_ref().display())]
     pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -731,13 +784,30 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         flock(&repository, FlockOperation::LockShared)
             .context("Cannot lock composefs repository")?;
 
+        // Auto-detect security mode from meta.json's verity status.
+        let insecure = !Self::probe_metadata_verity(&repository);
+
         Ok(Self {
             repository,
             objects: OnceCell::new(),
             write_semaphore: OnceCell::new(),
-            insecure: false,
+            insecure,
             _data: std::marker::PhantomData,
         })
+    }
+
+    /// Check whether meta.json exists and has fs-verity enabled.
+    fn probe_metadata_verity(repo_fd: &OwnedFd) -> bool {
+        let meta_fd = match openat(
+            repo_fd,
+            REPO_METADATA_FILENAME,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(_) => return false, // absent or unreadable → no verity
+        };
+        matches!(measure_verity_opt::<ObjectID>(&meta_fd), Ok(Some(_)))
     }
 
     /// Open the default user-owned composefs repository.
@@ -1037,13 +1107,36 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(fd)
     }
 
-    /// By default fsverity is required to be enabled on the target
-    /// filesystem. Setting this disables verification of digests
-    /// and an instance of [`Self`] can be used on a filesystem
-    /// without fsverity support.
-    pub fn set_insecure(&mut self, insecure: bool) -> &mut Self {
-        self.insecure = insecure;
+    /// Returns whether the repository is in insecure mode.
+    ///
+    /// This is auto-detected from whether `meta.json` has fs-verity
+    /// enabled, but can be overridden with [`set_insecure`].
+    pub fn is_insecure(&self) -> bool {
+        self.insecure
+    }
+
+    /// Mark this repository as insecure, disabling verification of
+    /// fs-verity digests.  This allows operation on filesystems
+    /// without verity support.
+    pub fn set_insecure(&mut self) -> &mut Self {
+        self.insecure = true;
         self
+    }
+
+    /// Require that this repository has fs-verity enabled.
+    ///
+    /// Returns an error if the repository was not initialized with
+    /// verity on `meta.json`, since there is no mechanism to
+    /// retroactively enable verity on existing objects.
+    pub fn require_verity(&self) -> Result<()> {
+        if self.insecure {
+            bail!(
+                "repository was not initialized with fs-verity \
+                 (hint: re-create with `cfsctl init` on a \
+                 verity-capable filesystem)"
+            );
+        }
+        Ok(())
     }
 
     /// Creates a SplitStreamWriter for writing a split stream.
@@ -2520,7 +2613,7 @@ mod tests {
     fn create_test_repo(path: &Path) -> Result<Arc<Repository<Sha512HashValue>>> {
         mkdirat(CWD, path, Mode::from_raw_mode(0o755))?;
         let mut repo = Repository::open_path(CWD, path)?;
-        repo.set_insecure(true);
+        repo.set_insecure();
         Ok(Arc::new(repo))
     }
 
@@ -3898,7 +3991,7 @@ mod tests {
         let repo = create_test_repo(&tmp.path().join("repo"))?;
 
         let meta = RepoMetadata::for_hash::<Sha512HashValue>();
-        write_repo_metadata(&repo.repo_fd(), &meta)?;
+        write_repo_metadata(&repo.repo_fd(), &meta, false)?;
 
         let result = repo.fsck().await?;
         assert!(result.is_ok());
@@ -3940,7 +4033,7 @@ mod tests {
         let repo = create_test_repo(&tmp.path().join("repo"))?;
 
         let meta = RepoMetadata::for_hash::<crate::fsverity::Sha256HashValue>();
-        write_repo_metadata(&repo.repo_fd(), &meta)?;
+        write_repo_metadata(&repo.repo_fd(), &meta, false)?;
 
         let result = repo.fsck().await?;
         assert!(!result.is_ok());

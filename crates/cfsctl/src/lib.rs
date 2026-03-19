@@ -92,11 +92,15 @@ pub struct App {
     #[clap(long, value_enum)]
     pub hash: Option<HashType>,
 
-    /// Sets the repository to insecure before running any operation and
-    /// prepend '?' to the composefs kernel command line when writing
-    /// boot entry.
-    #[clap(long)]
+    /// Deprecated: security mode is now auto-detected from meta.json.
+    /// Use `cfsctl init --insecure` to create a repo without verity.
+    /// Kept for backward compatibility.
+    #[clap(long, hide = true)]
     insecure: bool,
+
+    /// Error if the repository does not have fs-verity enabled.
+    #[clap(long)]
+    require_verity: bool,
 
     #[clap(subcommand)]
     cmd: Command,
@@ -281,8 +285,9 @@ enum Command {
     /// Initialize a new composefs repository with a metadata file.
     ///
     /// Creates the repository directory (if it doesn't exist) and writes
-    /// a `meta.json` recording the digest algorithm. Subsequent commands
-    /// will auto-detect the algorithm from this file and error on mismatch.
+    /// a `meta.json` recording the digest algorithm.  By default fs-verity
+    /// is enabled on `meta.json`, signaling that all objects require
+    /// verity.  Use `--insecure` to skip (e.g. on tmpfs).
     Init {
         /// The fs-verity algorithm identifier.
         /// Format: fsverity-<hash>-<lg_blocksize>, e.g. fsverity-sha512-12
@@ -291,6 +296,9 @@ enum Command {
         /// Path to the repository directory (created if it doesn't exist).
         /// If omitted, uses --repo/--user/--system location.
         path: Option<PathBuf>,
+        /// Do not enable fs-verity on meta.json (insecure repository).
+        #[clap(long)]
+        insecure: bool,
     },
     /// Take a transaction lock on the repository.
     /// This prevents garbage collection from occurring.
@@ -479,9 +487,10 @@ pub async fn run_app(args: App) -> Result<()> {
     if let Command::Init {
         ref algorithm,
         ref path,
+        insecure,
     } = args.cmd
     {
-        return run_init(algorithm, path.as_deref(), &args);
+        return run_init(algorithm, path.as_deref(), insecure || args.insecure, &args);
     }
 
     let repo_path = resolve_repo_path(&args)?;
@@ -494,7 +503,7 @@ pub async fn run_app(args: App) -> Result<()> {
 }
 
 /// Handle `cfsctl init`
-fn run_init(algorithm: &Algorithm, path: Option<&Path>, args: &App) -> Result<()> {
+fn run_init(algorithm: &Algorithm, path: Option<&Path>, insecure: bool, args: &App) -> Result<()> {
     let meta = RepoMetadata::new(algorithm.clone());
 
     let repo_path = if let Some(p) = path {
@@ -539,7 +548,7 @@ fn run_init(algorithm: &Algorithm, path: Option<&Path>, args: &App) -> Result<()
     )
     .with_context(|| format!("opening repository directory {}", repo_path.display()))?;
 
-    write_repo_metadata(&repo_fd, &meta)?;
+    write_repo_metadata(&repo_fd, &meta, !insecure)?;
 
     println!(
         "Initialized composefs repository at {}",
@@ -547,6 +556,11 @@ fn run_init(algorithm: &Algorithm, path: Option<&Path>, args: &App) -> Result<()
     );
     println!("  algorithm: {}", meta.algorithm);
     println!("  version:   {}", meta.version);
+    if insecure {
+        println!("  verity:    not required (insecure)");
+    } else {
+        println!("  verity:    required");
+    }
 
     Ok(())
 }
@@ -558,7 +572,14 @@ where
 {
     let path = resolve_repo_path(args)?;
     let mut repo = Repository::open_path(CWD, path)?;
-    repo.set_insecure(args.insecure);
+    // Hidden --insecure flag for backward compatibility: only
+    // overrides toward insecure, never toward secure.
+    if args.insecure {
+        repo.set_insecure();
+    }
+    if args.require_verity {
+        repo.require_verity()?;
+    }
     Ok(repo)
 }
 
@@ -869,7 +890,7 @@ where
                     &repo,
                     entry,
                     &id,
-                    args.insecure,
+                    repo.is_insecure(),
                     bootdir,
                     None,
                     entry_id.as_deref(),

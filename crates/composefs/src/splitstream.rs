@@ -996,7 +996,7 @@ mod tests {
     fn create_test_repo(path: &Path) -> Result<Arc<Repository<Sha256HashValue>>> {
         mkdirat(CWD, path, Mode::from_raw_mode(0o755))?;
         let mut repo = Repository::open_path(CWD, path)?;
-        repo.set_insecure(true);
+        repo.set_insecure();
         Ok(Arc::new(repo))
     }
 

@@ -472,7 +472,7 @@ mod tests {
         }
 
         let mut repo = Repository::open_path(&fd, ".").unwrap();
-        repo.set_insecure(true);
+        repo.set_insecure();
 
         Ok(Arc::new(repo))
     }

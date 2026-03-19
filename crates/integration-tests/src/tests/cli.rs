@@ -1062,3 +1062,75 @@ fn test_fsck_detects_broken_image_ref() -> Result<()> {
     Ok(())
 }
 integration_test!(test_fsck_detects_broken_image_ref);
+
+fn test_init_insecure() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    let output = cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
+    assert!(
+        output.contains("Initialized"),
+        "expected initialization message, got: {output}"
+    );
+    assert!(
+        output.contains("insecure"),
+        "expected insecure in output, got: {output}"
+    );
+
+    // Operations should work without --insecure flag (auto-detected)
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+    let image_id = cmd!(sh, "{cfsctl} --repo {repo} create-image {rootfs}").read()?;
+    assert!(
+        !image_id.trim().is_empty(),
+        "should produce image ID on insecure repo"
+    );
+
+    let output = cmd!(sh, "{cfsctl} --repo {repo} gc").read()?;
+    assert!(
+        output.contains("Objects:"),
+        "gc should work on insecure repo, got: {output}"
+    );
+
+    Ok(())
+}
+integration_test!(test_init_insecure);
+
+fn test_require_verity_fails_on_insecure_repo() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    // Create an insecure repo
+    cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
+
+    // --require-verity should fail
+    let result = cmd!(sh, "{cfsctl} --require-verity --repo {repo} gc").read();
+    assert!(
+        result.is_err(),
+        "--require-verity should fail on insecure repo"
+    );
+
+    Ok(())
+}
+integration_test!(test_require_verity_fails_on_insecure_repo);
+
+fn test_require_verity_fails_on_legacy_repo() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    // Legacy repo: no init, no meta.json — should auto-detect as insecure
+    let result = cmd!(sh, "{cfsctl} --require-verity --repo {repo} gc").read();
+    assert!(
+        result.is_err(),
+        "--require-verity should fail on repo without meta.json"
+    );
+
+    Ok(())
+}
+integration_test!(test_require_verity_fails_on_legacy_repo);
