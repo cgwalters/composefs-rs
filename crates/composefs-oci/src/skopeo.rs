@@ -518,6 +518,9 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     img_proxy_config: Option<ImageProxyConfig>,
     reporter: SharedReporter,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
+    // Fail fast if the repository is read-only, before starting any
+    // network or image-proxy work.
+    repo.ensure_writable()?;
     let image_ref =
         ImageReference::try_from(imgref).context("Parsing image reference transport")?;
 
