@@ -2028,6 +2028,7 @@ mod test {
         }
     }
 
+
     /// Verify that the full OCI pipeline works when all splitstreams use the
     /// old (pre-repr(C)) header layout — the format that bootc <= 1.15.x wrote.
     ///
