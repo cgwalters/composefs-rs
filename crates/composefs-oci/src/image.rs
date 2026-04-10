@@ -273,7 +273,6 @@ mod test {
         tree::{LeafContent, RegularFile, Stat},
     };
     use std::{
-        cell::RefCell,
         collections::BTreeMap,
         io::BufRead,
         path::{Path, PathBuf},
