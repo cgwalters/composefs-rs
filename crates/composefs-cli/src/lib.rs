@@ -1,12 +1,12 @@
-//! Library for `cfsctl` command line utility
+//! Library for the `cfsctl` command line utility
 //!
 //! This crate also re-exports all composefs-rs library crates, so downstream
-//! consumers can take a single dependency on `cfsctl` instead of listing each
+//! consumers can take a single dependency on `composefs-cli` instead of listing each
 //! crate individually.
 //!
 //! ```
-//! use cfsctl::composefs::repository::Repository;
-//! use cfsctl::composefs::fsverity::Sha256HashValue;
+//! use composefs_cli::composefs::repository::Repository;
+//! use composefs_cli::composefs::fsverity::Sha256HashValue;
 //!
 //! let repo = Repository::<Sha256HashValue>::open_path(
 //!     rustix::fs::CWD,

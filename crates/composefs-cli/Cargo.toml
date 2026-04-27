@@ -1,5 +1,5 @@
 [package]
-name = "cfsctl"
+name = "composefs-cli"
 description = "Command-line utility for composefs"
 default-run = "cfsctl"
 
@@ -9,6 +9,10 @@ readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+
+[[bin]]
+name = "cfsctl"
+path = "src/main.rs"
 
 [lib]
 path = "src/lib.rs"

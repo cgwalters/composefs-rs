@@ -4,7 +4,7 @@
 //! creating and mounting filesystem images, handling OCI containers, and performing
 //! repository maintenance operations like garbage collection.
 
-use cfsctl::App;
+use composefs_cli::App;
 
 use anyhow::Result;
 use clap::Parser;
@@ -26,5 +26,5 @@ async fn async_main() -> Result<()> {
     env_logger::init();
 
     let args = App::parse();
-    cfsctl::run_app(args).await
+    composefs_cli::run_app(args).await
 }

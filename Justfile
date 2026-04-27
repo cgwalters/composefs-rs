@@ -22,9 +22,9 @@ clippy:
 
 # Verify cfsctl builds with each optional feature combination
 check-feature-combos:
-    cargo clippy -p cfsctl --no-default-features -- -D warnings
-    cargo clippy -p cfsctl --no-default-features --features oci -- -D warnings
-    cargo clippy -p cfsctl --no-default-features --features http -- -D warnings
+    cargo clippy -p composefs-cli --no-default-features -- -D warnings
+    cargo clippy -p composefs-cli --no-default-features --features oci -- -D warnings
+    cargo clippy -p composefs-cli --no-default-features --features http -- -D warnings
     cargo clippy -p composefs-oci -- -D warnings
     cargo clippy -p composefs-oci --features boot -- -D warnings
 

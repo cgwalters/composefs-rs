@@ -41,7 +41,7 @@ RUN --network=none \
     --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    cargo build --release -p cfsctl --features="${cfsctl_features}" -p integration-tests && \
+    cargo build --release -p composefs-cli --features="${cfsctl_features}" -p integration-tests && \
     cp /src/target/release/cfsctl /usr/bin/cfsctl && \
     cp /src/target/release/cfsctl-integration-tests /usr/bin/cfsctl-integration-tests
 
