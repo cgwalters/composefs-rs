@@ -2,6 +2,11 @@
 name = "splitfdstream"
 description = "Binary format for serializing data with external file descriptor references"
 keywords = ["splitfdstream", "fd", "serialization"]
+# TODO: composefs-cstorage currently uses jsonrpc-fdpass with base64-encoded segments
+# for its userns helper stream protocol. This crate was originally designed for exactly
+# that use case and would be more efficient (binary framing vs base64 overhead).
+# Consider switching composefs-cstorage to use splitfdstream instead.
+publish = false
 
 edition.workspace = true
 license.workspace = true
