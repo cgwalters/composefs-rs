@@ -2,7 +2,7 @@
 //!
 //! This module provides functionality to import container images directly from
 //! containers-storage (as used by podman/buildah) into composefs repositories.
-//! It uses the cstorage crate to access the storage and leverages reflinks when
+//! It uses the composefs-cstorage crate to access the storage and leverages reflinks when
 //! available to avoid copying file data, enabling efficient zero-copy extraction.
 //!
 //! This module requires the `containers-storage` feature to be enabled.
@@ -52,13 +52,13 @@ use composefs::{
     repository::{ImportContext, ObjectStoreMethod, Repository},
 };
 
-use cstorage::{
+use composefs_cstorage::{
     Image, Layer, ProxiedTarSplitItem, Storage, StorageProxy, TarSplitFdStream, TarSplitItem,
     can_bypass_file_permissions,
 };
 
 // Re-export init_if_helper for consumers that need userns helper support
-pub use cstorage::init_if_helper;
+pub use composefs_cstorage::init_if_helper;
 
 use crate::oci_image::manifest_identifier;
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};

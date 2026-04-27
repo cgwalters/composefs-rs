@@ -1,5 +1,5 @@
 [package]
-name = "cstorage"
+name = "composefs-cstorage"
 description = "Read-only access to containers-storage (overlay driver)"
 keywords = ["containers", "storage", "overlay", "podman", "buildah"]
 

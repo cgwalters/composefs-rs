@@ -13,7 +13,7 @@ fn main() -> Result<()> {
     // If we were spawned as a userns helper process, handle that and exit.
     // This MUST be called before the tokio runtime is created.
     #[cfg(feature = "containers-storage")]
-    cstorage::init_if_helper();
+    composefs_cstorage::init_if_helper();
 
     // Now we can create the tokio runtime for the main application
     tokio::runtime::Builder::new_multi_thread()

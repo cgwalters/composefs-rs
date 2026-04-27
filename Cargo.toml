@@ -12,7 +12,7 @@ default-members = [
     "crates/composefs-ioctls",
     "crates/composefs-oci",
     "crates/composefs-setup-root",
-    "crates/cstorage",
+    "crates/composefs-cstorage",
     "crates/erofs-debug",
     "crates/splitfdstream",
 ]
