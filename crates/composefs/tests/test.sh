@@ -54,7 +54,7 @@ mount -o bind "${blkdev}" "${sysroot}"
 
 composefs-setup-root \
     --config "${config}" \
-    --cmdline "composefs=${imageid}" \
+    --cmdline "composefs.digest=${imageid}" \
     --root-fs "${root}" \
     --sysroot "${sysroot}" \
     ${null}

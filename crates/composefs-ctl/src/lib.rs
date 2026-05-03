@@ -49,17 +49,22 @@ use composefs::progress::{
     ComponentId, ProgressEvent, ProgressReporter, ProgressUnit, SharedReporter,
 };
 use composefs_boot::BootOps;
+use composefs_boot::cmdline::ComposefsCmdline;
 #[cfg(feature = "oci")]
 use composefs_boot::write_boot;
 
+use composefs::erofs::format::FormatVersion;
 #[cfg(feature = "oci")]
 use composefs::shared_internals::IO_BUF_CAPACITY;
 use composefs::{
     dumpfile::{dump_single_dir, dump_single_file},
-    erofs::reader::erofs_to_filesystem,
+    erofs::{format::FormatSet, reader::erofs_to_filesystem},
     fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     generic_tree::{FileSystem, Inode},
-    repository::{REPO_METADATA_FILENAME, Repository, read_repo_algorithm, system_path, user_path},
+    repository::{
+        REPO_METADATA_FILENAME, Repository, RepositoryConfig, read_repo_algorithm, system_path,
+        user_path,
+    },
     tree::RegularFile,
 };
 
@@ -187,6 +192,11 @@ pub struct App {
     #[clap(long, value_enum)]
     pub hash: Option<HashType>,
 
+    /// The EROFS format version to use when generating images.
+    /// If omitted, the library default (V2) is used.
+    #[clap(long, value_enum)]
+    pub erofs_version: Option<ErofsVersion>,
+
     /// Deprecated: security mode is now auto-detected from meta.json.
     /// Use `cfsctl init --insecure` to create a repo without verity.
     /// Kept for backward compatibility.
@@ -219,6 +229,44 @@ pub enum HashType {
     Sha256,
     /// Sha512
     Sha512,
+}
+
+/// The EROFS format version used when generating images.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ErofsVersion {
+    /// Format V1: compact inodes, BFS, C-compatible.
+    #[clap(name = "1")]
+    V1,
+    /// Format V2: extended inodes, DFS, current default.
+    #[clap(name = "2")]
+    V2,
+}
+
+impl From<ErofsVersion> for composefs::erofs::format::FormatVersion {
+    fn from(v: ErofsVersion) -> Self {
+        match v {
+            ErofsVersion::V1 => Self::V1,
+            ErofsVersion::V2 => Self::V2,
+        }
+    }
+}
+
+/// EROFS format generation mode for `cfsctl init --erofs`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ErofsMode {
+    /// Generate only V1 EROFS (default; compatible with C `mkcomposefs`/`composefs-info` 1.0.8).
+    V1,
+    /// Generate both V1 and V2 EROFS (dual mode, used by bootc and other multi-format consumers).
+    Dual,
+}
+
+impl From<ErofsMode> for FormatSet {
+    fn from(m: ErofsMode) -> Self {
+        match m {
+            ErofsMode::V1 => FormatSet::V1_ONLY,
+            ErofsMode::Dual => FormatSet::BOTH,
+        }
+    }
 }
 
 /// A reference to an OCI image: either a content digest or a named ref.
@@ -434,6 +482,28 @@ enum OciCommand {
         config_opts: OCIConfigFilesystemOptions,
     },
 
+    /// Compute the composefs boot image karg for a stored OCI image.
+    ///
+    /// Applies the bootable transformation (SELinux relabeling, empty /boot and /sysroot),
+    /// computes the V1 EROFS digest, and prints the full kernel argument string:
+    ///
+    ///   composefs.digest=<hex>
+    ///
+    /// This is intended for use in UKI Containerfile builds where no composefs
+    /// repository is available.  The output can be written directly to
+    /// /etc/kernel/cmdline:
+    ///
+    ///   cfsctl oci composefs-digest-karg @sha256:abc... > /etc/kernel/cmdline
+    ///
+    /// The image can be specified by ref name or @digest:
+    ///   cfsctl oci composefs-digest-karg myimage:latest
+    ///   cfsctl oci composefs-digest-karg @sha256:a1b2c3...
+    #[clap(name = "composefs-digest-karg")]
+    ComposefsDigestKarg {
+        #[clap(flatten)]
+        config_opts: OCIConfigOptions,
+    },
+
     /// Create the composefs image of the rootfs of a stored OCI image, perform bootable transformation, commit it to the repo,
     /// then configure boot for the image by writing new boot resources and bootloader entries to boot partition. Performs
     /// state preparation for composefs-setup-root consumption as well. Note that state preparation here is not suitable for
@@ -503,6 +573,20 @@ enum Command {
         /// re-imported after migration.
         #[clap(long)]
         reset_metadata: bool,
+        /// Default EROFS format version for images in this repository.
+        /// V1 is compatible with C `mkcomposefs` 1.0.8.
+        /// If omitted, falls back to the global `--erofs-version` flag, then defaults to V2.
+        #[clap(long)]
+        erofs_version: Option<ErofsVersion>,
+        /// EROFS format generation mode.
+        ///
+        /// Controls which EROFS format versions are produced when committing images:
+        ///   v1    Generate only V1 EROFS (default; C-tool compatible)
+        ///   dual  Generate both V1 and V2 EROFS (used by bootc)
+        ///
+        /// If omitted, defaults to `v1`.
+        #[clap(long, value_enum)]
+        erofs: Option<ErofsMode>,
     },
     /// Take a transaction lock on the repository.
     /// This prevents garbage collection from occurring.
@@ -548,6 +632,24 @@ enum Command {
     /// Note that this does not create or commit the composefs image itself, and does not
     /// store any file objects in the repository.
     ComputeId {
+        #[clap(flatten)]
+        fs_opts: FsReadOptions,
+    },
+    /// Read rootfs located at a path and compute the composefs kernel argument string.
+    ///
+    /// Like compute-id but outputs the full kernel argument rather than the bare digest,
+    /// choosing the argument name based on the EROFS format version:
+    ///
+    ///   V1 (default): composefs.digest=<hex>
+    ///   V2:           composefs=<hex>
+    ///
+    /// Use --erofs-version to select the format; defaults to V1.
+    /// Use --bootable to apply the boot transformation (SELinux relabeling, empty /boot and /sysroot).
+    ///
+    /// Example (in a Containerfile):
+    ///   cfsctl --erofs-version 1 compute-karg --bootable /mnt/base > /etc/kernel/cmdline
+    #[clap(name = "compute-karg")]
+    ComputeKarg {
         #[clap(flatten)]
         fs_opts: FsReadOptions,
     },
@@ -710,13 +812,29 @@ pub async fn run_app(args: App) -> Result<()> {
         ref path,
         insecure,
         reset_metadata,
+        erofs_version: ref init_erofs_version,
+        erofs: init_erofs,
     } = args.cmd
     {
+        // --erofs controls the FormatSet (which versions to generate); default V1_ONLY.
+        let erofs_formats = init_erofs
+            .map(FormatSet::from)
+            .unwrap_or(FormatSet::V1_ONLY);
+        // Prefer the subcommand-level --erofs-version; fall back to global flag.
+        // If neither is given, default to V1: that is the primary format for
+        // both v1-only and dual modes, and "cfsctl init" (no --erofs flag) is
+        // equivalent to "cfsctl init --erofs v1".
+        let erofs_version = init_erofs_version
+            .or(args.erofs_version)
+            .map(composefs::erofs::format::FormatVersion::from)
+            .unwrap_or(composefs::erofs::format::FormatVersion::V1);
         return run_init(
             algorithm,
             path.as_deref(),
             insecure || args.insecure,
             reset_metadata,
+            erofs_version,
+            erofs_formats,
             &args,
         );
     }
@@ -726,7 +844,9 @@ pub async fn run_app(args: App) -> Result<()> {
     if args.no_repo
         || matches!(
             args.cmd,
-            Command::ComputeId { .. } | Command::CreateDumpfile { .. }
+            Command::ComputeId { .. }
+                | Command::ComputeKarg { .. }
+                | Command::CreateDumpfile { .. }
         )
     {
         // If a repo path is available and --no-repo wasn't passed,
@@ -764,6 +884,8 @@ fn run_init(
     path: Option<&Path>,
     insecure: bool,
     reset_metadata: bool,
+    erofs_version: composefs::erofs::format::FormatVersion,
+    erofs_formats: FormatSet,
     args: &App,
 ) -> Result<()> {
     let repo_path = if let Some(p) = path {
@@ -784,12 +906,18 @@ fn run_init(
 
     // init_path handles idempotency: same algorithm is a no-op,
     // different algorithm is an error.
+    let config = {
+        let mut c = RepositoryConfig::new(*algorithm);
+        c.erofs_version = erofs_version;
+        c.erofs_formats = erofs_formats;
+        if insecure { c.set_insecure() } else { c }
+    };
     let created = match algorithm {
         Algorithm::Sha256 { .. } => {
-            Repository::<Sha256HashValue>::init_path(CWD, &repo_path, *algorithm, !insecure)?.1
+            Repository::<Sha256HashValue>::init_path(CWD, &repo_path, config)?.1
         }
         Algorithm::Sha512 { .. } => {
-            Repository::<Sha512HashValue>::init_path(CWD, &repo_path, *algorithm, !insecure)?.1
+            Repository::<Sha512HashValue>::init_path(CWD, &repo_path, config)?.1
         }
     };
 
@@ -831,6 +959,11 @@ where
     }
     if args.require_verity {
         repo.require_verity()?;
+    }
+    // If the user explicitly passed --erofs-version, override the stored
+    // repo setting for this invocation only (does not rewrite meta.json).
+    if let Some(version) = args.erofs_version {
+        repo.set_erofs_version(version.into());
     }
     Ok(repo)
 }
@@ -981,11 +1114,35 @@ fn dump_file_impl(
 
 /// Run commands that don't require a repository.
 pub async fn run_cmd_without_repo<ObjectID: FsVerityHashValue>(args: App) -> Result<()> {
+    let erofs_version = args
+        .erofs_version
+        .map(composefs::erofs::format::FormatVersion::from);
     match args.cmd {
         Command::ComputeId { fs_opts } => {
             let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None).await?;
-            let id = fs.compute_image_id();
+            let version = erofs_version.unwrap_or_default();
+            let id = composefs::fsverity::compute_verity::<ObjectID>(
+                &composefs::erofs::writer::mkfs_erofs_versioned(
+                    &composefs::erofs::writer::ValidatedFileSystem::new(fs)?,
+                    version,
+                ),
+            );
             println!("{}", id.to_hex());
+        }
+        Command::ComputeKarg { fs_opts } => {
+            let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None).await?;
+            let version = erofs_version.unwrap_or(FormatVersion::V1);
+            let id = composefs::fsverity::compute_verity::<ObjectID>(
+                &composefs::erofs::writer::mkfs_erofs_versioned(
+                    &composefs::erofs::writer::ValidatedFileSystem::new(fs)?,
+                    version,
+                ),
+            );
+            let karg = match version {
+                FormatVersion::V1 => ComposefsCmdline::new_v1(id, args.insecure),
+                FormatVersion::V2 => ComposefsCmdline::new_v2(id, args.insecure),
+            };
+            println!("{}", karg.to_cmdline_arg());
         }
         Command::CreateDumpfile { fs_opts } => {
             let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None).await?;
@@ -1072,8 +1229,27 @@ where
             }
             OciCommand::ComputeId { config_opts } => {
                 let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
-                let id = fs.compute_image_id();
+                let id = fs.compute_image_id(repo.erofs_version());
                 println!("{}", id.to_hex());
+            }
+            OciCommand::ComposefsDigestKarg { config_opts } => {
+                let verity = verity_opt(&config_opts.config_verity)?;
+                let (config_digest, config_verity) =
+                    resolve_oci_config(&repo, &config_opts.config_name, verity)?;
+                let mut fs = composefs_oci::image::create_filesystem(
+                    &repo,
+                    &config_digest,
+                    config_verity.as_ref(),
+                )?;
+                fs.transform_for_boot(&repo)?;
+                let digest = composefs::fsverity::compute_verity::<ObjectID>(
+                    &composefs::erofs::writer::mkfs_erofs_versioned(
+                        &composefs::erofs::writer::ValidatedFileSystem::new(fs)?,
+                        composefs::erofs::format::FormatVersion::V1,
+                    ),
+                );
+                let karg = ComposefsCmdline::new_v1(digest, repo.is_insecure());
+                println!("{}", karg.to_cmdline_arg());
             }
             OciCommand::Pull {
                 ref image,
@@ -1217,7 +1393,25 @@ where
                     config_verity.as_ref(),
                 )?;
                 let entries = fs.transform_for_boot(&repo)?;
-                let id = fs.commit_image(&repo, None)?;
+                let formats = repo.default_format_set();
+                let ids = fs.commit_images(&repo, None, formats)?;
+                // Prefer V1 digest; fall back to V2.
+                let id = ids
+                    .get(&FormatVersion::V1)
+                    .or_else(|| ids.get(&FormatVersion::V2))
+                    .ok_or_else(|| anyhow::anyhow!("commit_images produced no images"))?
+                    .clone();
+
+                let insecure = repo.is_insecure();
+                let karg = if formats.contains(FormatVersion::V1)
+                    && !formats.contains(FormatVersion::V2)
+                {
+                    // V1-only repo → composefs.digest= (with optional ? for insecure)
+                    ComposefsCmdline::new_v1(id, insecure)
+                } else {
+                    // BOTH or V2-only repo → composefs= (with optional ? for insecure)
+                    ComposefsCmdline::new_v2(id, insecure)
+                };
 
                 let Some(entry) = entries.into_iter().next() else {
                     anyhow::bail!("No boot entries!");
@@ -1227,8 +1421,7 @@ where
                 write_boot::write_boot_simple(
                     &repo,
                     entry,
-                    &id,
-                    repo.is_insecure(),
+                    &karg,
                     bootdir,
                     None,
                     entry_id.as_deref(),
@@ -1241,7 +1434,7 @@ where
                     .map(|p: &PathBuf| p.parent().unwrap())
                     .unwrap_or(Path::new("/sysroot"))
                     .join("state/deploy")
-                    .join(id.to_hex());
+                    .join(karg.digest().to_hex());
 
                 create_dir_all(state.join("var"))?;
                 create_dir_all(state.join("etc/upper"))?;
@@ -1276,9 +1469,13 @@ where
             let id = fs.commit_image(&repo, image_name.as_deref())?;
             println!("{}", id.to_id());
         }
-        Command::ComputeId { .. } | Command::CreateDumpfile { .. } => {
+        Command::ComputeId { .. }
+        | Command::ComputeKarg { .. }
+        | Command::CreateDumpfile { .. } => {
             // Handled in run_app before opening the repo
-            unreachable!("compute-id and create-dumpfile are dispatched without a repo");
+            unreachable!(
+                "compute-id, compute-karg, and create-dumpfile are dispatched without a repo"
+            );
         }
         Command::Mount { name, mountpoint } => {
             repo.mount_at(&name, &mountpoint)?;

@@ -65,10 +65,51 @@ created by `cfsctl init` and contains:
    - `read-only-compatible` — old tools may read but must not write.
    - `incompatible` — old tools must refuse the repository entirely.
 
+   The currently defined feature flags are:
+    - `cfs_erofs_version` (read-only-compatible) — present on repositories
+      whose default EROFS image format is V1.  The EROFS format version is
+      derived entirely from this flag: present → V1, absent → V2.  Old
+      tools that do not recognise this flag open the repository read-only
+      rather than accidentally writing images in the wrong format.
+    - `v1_erofs` (read-only-compatible) — controls how many EROFS format
+      versions are generated when committing images.  When **present**, the
+      repository generates only V1 EROFS (C-tool compatible mode, the
+      default for new repositories initialized with `cfsctl init` or
+      `cfsctl init --erofs v1`).  When **absent**, both V1 and V2 EROFS are
+      generated for each image (dual mode, used by bootc and other
+      multi-format consumers; enabled with `cfsctl init --erofs dual`).
+      Old tools that do not understand this flag treat the repository as
+      read-only rather than accidentally committing images in the wrong set
+      of formats.  `v1_erofs` and `cfs_erofs_version` are independent and
+      may both be present.
+
 When `meta.json` is present, `cfsctl` auto-detects the hash algorithm and
 errors if `--hash` is explicitly passed with a conflicting value.  When
 the file is absent (for repositories created before this feature), `--hash`
 is honored as before and defaults to `sha512`.
+
+### `cfsctl init --erofs`
+
+The `--erofs` flag controls which EROFS format versions are generated when
+images are committed to the repository.  It maps to the `v1_erofs` feature
+flag in `meta.json`:
+
+```
+cfsctl init --erofs v1    # default: generate only V1 EROFS (C-tool compatible)
+cfsctl init --erofs dual  # generate both V1 and V2 EROFS (bootc mode)
+```
+
+Omitting `--erofs` is equivalent to `--erofs v1`.  The `dual` mode is
+intended for consumers such as bootc that need to serve both the C-tool
+compatible V1 format and the composefs-rs native V2 format from the same
+repository.
+
+Upgrading an existing repository from `v1` to `dual` by re-running
+`cfsctl init --erofs dual` is explicitly supported: `meta.json` is
+rewritten in place to clear the `v1_erofs` flag.  Downgrading in the
+reverse direction (from `dual` back to `v1`) is rejected with an error,
+because silently stopping V2 generation could leave sealed UKIs or other
+consumers without the EROFS image format they depend on.
 
 ## `objects/`
 
