@@ -81,7 +81,7 @@ const INODE_DATALAYOUT_FLAT_INLINE: u16 = 4;
 const INODE_DATALAYOUT_CHUNK_BASED: u16 = 8;
 
 /// Data layout method for file content storage
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum DataLayout {
     /// File data stored in separate blocks
@@ -271,10 +271,54 @@ impl std::ops::BitOr<u32> for FileType {
 
 /// EROFS format version number
 pub const VERSION: U32 = U32::new(1);
-/// Composefs-specific version number
+/// Composefs-specific version number (V2, Rust-native format)
 pub const COMPOSEFS_VERSION: U32 = U32::new(2);
+/// Composefs-specific version number for V1 (C-compatible format: compact inodes, whiteout table)
+pub const COMPOSEFS_VERSION_V1: U32 = U32::new(0);
 /// Magic number identifying composefs images
 pub const COMPOSEFS_MAGIC: U32 = U32::new(0xd078629a);
+
+/// Format version for composefs images
+///
+/// This enum represents the different format versions supported by composefs.
+/// The format version affects the composefs header version field and build time handling.
+///
+/// Serialized as an integer: V1 → `1`, V2 → `2`.
+#[repr(u32)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde_repr::Serialize_repr,
+    serde_repr::Deserialize_repr,
+)]
+pub enum FormatVersion {
+    /// Format V1: compact inodes, whiteout table.
+    ///
+    /// This is the original format used by older versions of composefs.
+    /// Build time is set to the minimum mtime across all inodes.
+    /// The `composefs_version` header field is 0 normally, but 1 when
+    /// user-land whiteout files are present (matching C mkcomposefs behavior).
+    V1 = 1,
+    /// Format V2: extended inodes, no whiteout table, composefs_version=2
+    ///
+    /// This is the current default format.
+    #[default]
+    V2 = 2,
+}
+
+impl FormatVersion {
+    /// Returns the composefs_version value for this format version
+    pub fn composefs_version(self) -> U32 {
+        match self {
+            FormatVersion::V1 => COMPOSEFS_VERSION_V1,
+            FormatVersion::V2 => COMPOSEFS_VERSION,
+        }
+    }
+}
 
 /// Flag indicating the presence of ACL data
 pub const COMPOSEFS_FLAGS_HAS_ACL: U32 = U32::new(1 << 0);
@@ -493,7 +537,52 @@ pub struct XAttrHeader {
     pub value_size: U16,
 }
 
-/// Standard xattr name prefixes indexed by name_index
+/// EROFS xattr prefix index for `system.posix_acl_access` (index 2).
+pub const XATTR_INDEX_POSIX_ACL_ACCESS: u8 = 2;
+/// EROFS xattr prefix index for `system.posix_acl_default` (index 3).
+pub const XATTR_INDEX_POSIX_ACL_DEFAULT: u8 = 3;
+/// EROFS xattr prefix index for `lustre.` (index 5).
+/// Absent from C mkcomposefs v1.0.8's prefix table; V1 writer skips it.
+pub const XATTR_INDEX_LUSTRE: u8 = 5;
+
+// Overlay xattr keys used by composefs V1 whiteout escaping.
+// Named to match the C mkcomposefs OVERLAY_XATTR_* constants.
+/// `trusted.overlay.overlay.whiteout` — V1 escaped whiteout marker.
+pub const XATTR_OVERLAY_WHITEOUT: &[u8] = b"trusted.overlay.overlay.whiteout";
+/// `user.overlay.whiteout` — userxattr escaped whiteout marker.
+pub const XATTR_USERXATTR_WHITEOUT: &[u8] = b"user.overlay.whiteout";
+/// `trusted.overlay.overlay.whiteouts` — escaped whiteouts directory marker.
+pub const XATTR_OVERLAY_WHITEOUTS: &[u8] = b"trusted.overlay.overlay.whiteouts";
+/// `user.overlay.whiteouts` — userxattr whiteouts directory marker.
+pub const XATTR_USERXATTR_WHITEOUTS: &[u8] = b"user.overlay.whiteouts";
+/// `trusted.overlay.overlay.opaque` — escaped opaque directory marker.
+pub const XATTR_OVERLAY_OPAQUE: &[u8] = b"trusted.overlay.overlay.opaque";
+/// `user.overlay.opaque` — userxattr opaque directory marker.
+pub const XATTR_USERXATTR_OPAQUE: &[u8] = b"user.overlay.opaque";
+/// `trusted.overlay.opaque` — root opaque marker written by V1 writer.
+pub const XATTR_OVERLAY_OPAQUE_ROOT: &[u8] = b"trusted.overlay.opaque";
+/// `trusted.overlay.metacopy` — metacopy marker (C adds redirect xattr too).
+pub const XATTR_OVERLAY_METACOPY: &[u8] = b"trusted.overlay.metacopy";
+/// `trusted.overlay.redirect` — redirect target xattr.
+pub const XATTR_OVERLAY_REDIRECT: &[u8] = b"trusted.overlay.redirect";
+/// `trusted.overlay.` prefix — all xattrs with this prefix are escaped in V1.
+pub const XATTR_OVERLAY_PREFIX: &[u8] = b"trusted.overlay.";
+/// `trusted.overlay.overlay.` prefix — escaped overlay xattr prefix.
+pub const XATTR_OVERLAY_ESCAPED_PREFIX: &[u8] = b"trusted.overlay.overlay.";
+/// `security.selinux` — SELinux label, copied to overlay whiteout stubs.
+pub const XATTR_SECURITY_SELINUX: &[u8] = b"security.selinux";
+
+/// Standard xattr name prefixes indexed by EROFS name_index.
+///
+/// Index 0 is the fallback (empty prefix, full name stored as suffix).
+/// Indices 1–6 map to the well-known EROFS prefix constants:
+///   EROFS_XATTR_INDEX_USER=1, POSIX_ACL_ACCESS=2, POSIX_ACL_DEFAULT=3,
+///   EROFS_XATTR_INDEX_TRUSTED=4, EROFS_XATTR_INDEX_LUSTRE=5, EROFS_XATTR_INDEX_SECURITY=6.
+///
+/// **V1 compatibility note:** C mkcomposefs v1.0.8 does NOT include `lustre.` (index 5)
+/// in its prefix table. Any `lustre.*` xattr is therefore encoded with prefix index 0
+/// (raw fallback) by C. For V1 images the writer must skip index 5 during prefix
+/// matching so that `lustre.*` xattrs fall through to the empty-string fallback.
 pub const XATTR_PREFIXES: [&[u8]; 7] = [
     b"",
     b"user.",

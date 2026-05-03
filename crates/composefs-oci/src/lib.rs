@@ -806,7 +806,11 @@ mod test {
 
     use rustix::fs::CWD;
 
-    use composefs::{fsverity::Sha256HashValue, repository::Repository, test::tempdir};
+    use composefs::{
+        fsverity::Sha256HashValue,
+        repository::{Repository, RepositoryConfig},
+        test::tempdir,
+    };
 
     use super::*;
 
@@ -843,13 +847,9 @@ mod test {
     fn create_test_repo() -> (tempfile::TempDir, Arc<Repository<Sha256HashValue>>) {
         let dir = tempdir();
         let repo_path = dir.path().join("repo");
-        let (repo, _) = Repository::init_path(
-            CWD,
-            &repo_path,
-            composefs::fsverity::Algorithm::SHA256,
-            false,
-        )
-        .expect("initializing test repo");
+        let (repo, _) =
+            Repository::init_path(CWD, &repo_path, RepositoryConfig::default().set_insecure())
+                .expect("initializing test repo");
         (dir, Arc::new(repo))
     }
 

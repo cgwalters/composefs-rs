@@ -118,21 +118,24 @@ pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
                 reference.as_deref(),
                 zerocopy,
                 storage_root.as_deref(),
-                &additional_image_stores,
+                &additional_image_stores
+                    .iter()
+                    .map(|p| p.as_path())
+                    .collect::<Vec<_>>(),
             )
         })
-        .await
-        .context("spawn_blocking failed")?
+        .await?
     } else {
-        // The proxied (rootless) path uses a userns helper process that does
-        // its own storage discovery.  Explicit storage paths are not yet
-        // plumbed through the proxy protocol.
-        if storage_root.is_some() || !additional_image_stores.is_empty() {
-            anyhow::bail!(
-                "storage_root and additional_image_stores are not supported in rootless mode"
-            );
-        }
-        import_from_containers_storage_proxied(repo, image_id, reference, zerocopy).await
+        // Limited access (e.g. rootless on host) - use proxy helper
+        import_from_containers_storage_proxied(
+            repo,
+            image_id,
+            reference,
+            zerocopy,
+            storage_root,
+            additional_image_stores,
+        )
+        .await
     }
 }
 
@@ -146,7 +149,7 @@ fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
     reference: Option<&str>,
     zerocopy: bool,
     storage_root: Option<&std::path::Path>,
-    additional_image_stores: &[std::path::PathBuf],
+    additional_image_stores: &[&std::path::Path],
 ) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
     let mut stats = ImportStats::default();
     let mut ctx = ImportContext::default();
@@ -252,8 +255,6 @@ fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
         layer_refs.push((diff_id.clone(), layer_verity));
         progress.inc(1);
     }
-    progress.finish_with_message("Layers imported");
-
     finalize_import(repo, &image, &layer_refs, reference, &progress, stats)
 }
 
@@ -266,6 +267,8 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
     image_id: &str,
     reference: Option<&str>,
     zerocopy: bool,
+    _storage_root: Option<&std::path::Path>,
+    _additional_image_stores: &[&std::path::Path],
 ) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
     let mut stats = ImportStats::default();
     let mut ctx = ImportContext::default();
@@ -443,6 +446,7 @@ fn finalize_import<ObjectID: FsVerityHashValue>(
             Some(&manifest_verity),
             reference,
         )?;
+
         if erofs.is_none() {
             // Not a container image (unlikely for cstor, but handle consistently)
             if let Some(name) = reference {

@@ -484,9 +484,6 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
-    // Fail fast if the repository is not writable, before doing any I/O.
-    repo.ensure_writable()?;
-
     let image_ref =
         ImageReference::try_from(imgref).context("Parsing image reference transport")?;
 
@@ -512,6 +509,7 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
         Some(&result.manifest_verity),
         reference,
     )?;
+
     if erofs.is_none() {
         // Not a container image (artifact) — tag the manifest directly
         if let Some(name) = reference {

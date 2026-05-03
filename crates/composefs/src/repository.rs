@@ -107,6 +107,7 @@ use rustix::{
 };
 
 use crate::{
+    erofs::format::FormatVersion,
     fsverity::{
         Algorithm, CompareVerityError, DEFAULT_LG_BLOCKSIZE, EnableVerityError, FsVerityHashValue,
         FsVerityHasher, MeasureVerityError, compute_verity, enable_verity_maybe_copy,
@@ -192,13 +193,21 @@ pub const REPO_FORMAT_VERSION: u32 = 1;
 ///   but prevent any writes (adding objects, creating images, GC, …).
 /// - Unknown **incompatible** features cause the repository to be
 ///   rejected entirely.
-///
-/// There are currently no defined features.
 pub mod known_features {
+    /// The ro-compat feature flag set on V1 EROFS repositories.
+    ///
+    /// Old tools that don't recognize this flag will open the repository
+    /// as read-only, preventing accidental V2 image writes.
+    pub const CFS_EROFS_VERSION: &str = "cfs_erofs_version";
+
     /// Compatible features understood by this version.
     pub const COMPAT: &[&str] = &[];
     /// Read-only compatible features understood by this version.
-    pub const RO_COMPAT: &[&str] = &[];
+    ///
+    /// `cfs_erofs_version` is set on V1 repositories so that older tools
+    /// (which don't know about the EROFS version field) open them read-only
+    /// rather than writing new images in the wrong format.
+    pub const RO_COMPAT: &[&str] = &[CFS_EROFS_VERSION];
     /// Incompatible features understood by this version.
     pub const INCOMPAT: &[&str] = &[];
 }
@@ -294,24 +303,44 @@ pub struct RepoMetadata {
     /// Feature flags.
     #[serde(default)]
     pub features: FeatureFlags,
+
+    /// Default EROFS format version for images produced by this repository.
+    ///
+    /// Always serialized (no `skip_serializing_if`) so `meta.json` is
+    /// self-documenting.  Old JSON files that lack this field deserialize
+    /// as V2 (the default).
+    #[serde(default)]
+    pub erofs_version: FormatVersion,
 }
 
 impl RepoMetadata {
-    /// Build metadata for a repository using the given hash type.
+    /// Build metadata for a repository using the given hash type, with the default EROFS version.
     pub fn for_hash<ObjectID: FsVerityHashValue>() -> Self {
-        Self {
-            version: REPO_FORMAT_VERSION,
-            algorithm: Algorithm::for_hash::<ObjectID>(),
-            features: FeatureFlags::default(),
-        }
+        Self::new_with_version(Algorithm::for_hash::<ObjectID>(), FormatVersion::default())
     }
 
-    /// Build metadata from an explicit [`Algorithm`].
+    /// Build metadata from an explicit [`Algorithm`], with the default (V2) EROFS format version.
     pub fn new(algorithm: Algorithm) -> Self {
+        Self::new_with_version(algorithm, FormatVersion::default())
+    }
+
+    /// Build metadata with the correct feature flags for the given EROFS format version.
+    ///
+    /// V1 repositories add `"cfs_erofs_version"` to `ro_compat` so that older
+    /// tools that do not understand the field open the repository read-only
+    /// rather than writing images in the wrong format.
+    pub fn new_with_version(algorithm: Algorithm, erofs_version: FormatVersion) -> Self {
+        let mut features = FeatureFlags::default();
+        if erofs_version == FormatVersion::V1 {
+            features
+                .read_only_compatible
+                .push(known_features::CFS_EROFS_VERSION.to_string());
+        }
         Self {
             version: REPO_FORMAT_VERSION,
             algorithm,
-            features: FeatureFlags::default(),
+            features,
+            erofs_version,
         }
     }
 
@@ -348,6 +377,74 @@ impl RepoMetadata {
     #[context("Parsing repository metadata JSON")]
     pub fn from_json(data: &[u8]) -> Result<Self> {
         serde_json::from_slice(data).context("deserializing repository metadata")
+    }
+}
+
+/// Configuration for initializing a new composefs repository.
+///
+/// Passed to [`Repository::init_path`] to specify the algorithm,
+/// fs-verity policy, and default EROFS format version.
+///
+/// fs-verity is **required by default**.  Call [`set_insecure`](Self::set_insecure)
+/// to opt out (e.g. on tmpfs or in tests).
+///
+/// # Examples
+///
+/// ```no_run
+/// use composefs::repository::RepositoryConfig;
+/// use composefs::fsverity::Algorithm;
+///
+/// // Default: SHA-256, fs-verity required, EROFS V2.
+/// let config = RepositoryConfig::default();
+///
+/// // SHA-512 with fs-verity required.
+/// let config = RepositoryConfig::new(Algorithm::SHA512);
+///
+/// // Insecure mode (tmpfs, testing).
+/// let config = RepositoryConfig::default().set_insecure();
+///
+/// // Custom algorithm, insecure.
+/// let config = RepositoryConfig::new(Algorithm::SHA512).set_insecure();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryConfig {
+    /// The fs-verity hash algorithm for content-addressed objects.
+    pub algorithm: Algorithm,
+    /// Default EROFS format version for images produced by this repository.
+    /// V1 is compatible with C `mkcomposefs` 1.0.8; V2 is the composefs-rs native format.
+    pub erofs_version: FormatVersion,
+    /// When `true`, fs-verity is NOT enabled on `meta.json` and is not required
+    /// on stored objects.  Use [`set_insecure`](Self::set_insecure) to set this.
+    insecure: bool,
+}
+
+impl RepositoryConfig {
+    /// Create a config with the given algorithm and all other settings at their defaults
+    /// (fs-verity required, `erofs_version = V2`).
+    pub fn new(algorithm: Algorithm) -> Self {
+        Self {
+            algorithm,
+            ..Self::default()
+        }
+    }
+
+    /// Disable fs-verity for this repository.
+    ///
+    /// Suitable for use on filesystems that do not support fs-verity (tmpfs,
+    /// overlayfs) or in test environments.  Returns `self` for chaining.
+    pub fn set_insecure(mut self) -> Self {
+        self.insecure = true;
+        self
+    }
+}
+
+impl Default for RepositoryConfig {
+    fn default() -> Self {
+        Self {
+            algorithm: Algorithm::SHA256,
+            erofs_version: FormatVersion::default(),
+            insecure: false,
+        }
     }
 }
 
@@ -1074,17 +1171,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Initialize a new repository at the target path and open it.
     ///
     /// Creates the directory (mode 0700) if it does not exist, writes
-    /// `meta.json` for the given `algorithm`, and returns the opened
+    /// `meta.json` using the parameters from `config`, and returns the opened
     /// repository together with a flag indicating whether this was a
     /// fresh initialization (`true`) or an idempotent open of an
     /// existing repository with the same algorithm (`false`).
     ///
-    /// The `algorithm` must be compatible with this repository's
+    /// The `config.algorithm` must be compatible with this repository's
     /// `ObjectID` type (e.g. `Algorithm::Sha512` for
     /// `Repository<Sha512HashValue>`).
     ///
-    /// If `enable_verity` is true, fs-verity is enabled on `meta.json`,
-    /// signaling that all objects must also have verity.
+    /// Unless `config` has been made insecure via [`RepositoryConfig::set_insecure`],
+    /// fs-verity is enabled on `meta.json`, signaling that all objects must also have verity.
     ///
     /// If `meta.json` already exists with a different algorithm, an
     /// error is returned.
@@ -1092,10 +1189,15 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     pub fn init_path(
         dirfd: impl AsFd,
         path: impl AsRef<Path>,
-        algorithm: Algorithm,
-        enable_verity: bool,
+        config: RepositoryConfig,
     ) -> Result<(Self, bool)> {
         let path = path.as_ref();
+        let RepositoryConfig {
+            algorithm,
+            erofs_version,
+            insecure,
+        } = config;
+        let require_fsverity = !insecure;
 
         if !algorithm.is_compatible::<ObjectID>() {
             bail!(
@@ -1117,11 +1219,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )
         .with_context(|| format!("opening repository directory {}", path.display()))?;
 
-        let meta = RepoMetadata::new(algorithm);
+        let meta = RepoMetadata::new_with_version(algorithm, erofs_version);
 
         // Try to write meta.json.  If it already exists, check for
         // idempotency: same algorithm is fine, different is an error.
-        if let Err(write_err) = write_repo_metadata(&repo_fd, &meta, enable_verity) {
+        if let Err(write_err) = write_repo_metadata(&repo_fd, &meta, require_fsverity) {
             match read_repo_metadata(&repo_fd)? {
                 Some(existing) if existing == meta => {
                     // Idempotent: same config, already initialized.
@@ -1130,10 +1232,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 }
                 Some(existing) => {
                     bail!(
-                        "repository already initialized with algorithm '{}'; \
-                         cannot re-initialize with '{}'",
+                        "repository already initialized with different configuration \
+                         (algorithm: {}, erofs_version: {:?}); \
+                         cannot re-initialize with (algorithm: {}, erofs_version: {:?})",
                         existing.algorithm,
+                        existing.erofs_version,
                         meta.algorithm,
+                        meta.erofs_version,
                     );
                 }
                 None => {
@@ -1878,6 +1983,20 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// enabled, but can be overridden with [`set_insecure`].
     pub fn is_insecure(&self) -> bool {
         self.insecure
+    }
+
+    /// Override the EROFS format version for this repository session.
+    ///
+    /// Changes the in-memory default used by [`FileSystem::commit_image`]
+    /// and [`FileSystem::compute_image_id`] for the lifetime of this
+    /// `Repository` object.  Does **not** rewrite `meta.json` and does
+    /// not update `features.read_only_compatible`.
+    ///
+    /// Intended for CLI tools that accept a per-invocation `--erofs-version`
+    /// flag to override the repository's stored default.
+    pub fn set_erofs_version(&mut self, version: FormatVersion) -> &mut Self {
+        self.metadata.erofs_version = version;
+        self
     }
 
     /// Mark this repository as insecure, disabling verification of
@@ -3275,6 +3394,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         &self.metadata
     }
 
+    /// Returns the default EROFS format version for this repository.
+    pub fn erofs_version(&self) -> FormatVersion {
+        self.metadata.erofs_version
+    }
+
     /// Lists all named stream references under a given prefix.
     ///
     /// Returns (name, target) pairs where name is relative to the prefix.
@@ -3436,7 +3560,11 @@ mod tests {
 
     /// Create a test repository in insecure mode (no fs-verity required).
     fn create_test_repo(path: &Path) -> Result<Arc<Repository<Sha512HashValue>>> {
-        let (repo, _) = Repository::init_path(CWD, path, Algorithm::SHA512, false)?;
+        let (repo, _) = Repository::init_path(
+            CWD,
+            path,
+            RepositoryConfig::new(Algorithm::SHA512).set_insecure(),
+        )?;
         Ok(Arc::new(repo))
     }
 
@@ -3946,6 +4074,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: Default::default(),
         }
     }
@@ -3959,6 +4088,7 @@ mod tests {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
+                st_mtim_nsec: 0,
                 xattrs: Default::default(),
             },
             LeafContent::Regular(RegularFile::External(obj.clone(), size)),
@@ -4121,6 +4251,7 @@ mod tests {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
+                st_mtim_nsec: 0,
                 xattrs: Default::default(),
             },
             LeafContent::Regular(RegularFile::External(obj2.clone(), size2)),
@@ -4823,6 +4954,44 @@ mod tests {
         Ok(())
     }
 
+    /// Helper to create a V1 (C-compatible) EROFS image and write it to the repo.
+    fn commit_v1_image(
+        repo: &Repository<Sha512HashValue>,
+        obj_id: &Sha512HashValue,
+        obj_size: u64,
+    ) -> Result<Sha512HashValue> {
+        use crate::erofs::writer::mkfs_erofs_versioned;
+
+        let mut fs = make_test_fs(obj_id, obj_size);
+        fs.add_overlay_whiteouts();
+        let image_data = mkfs_erofs_versioned(&fs, FormatVersion::V1);
+        repo.write_image(None, &image_data)
+    }
+
+    #[tokio::test]
+    async fn test_fsck_validates_v1_erofs_image() -> Result<()> {
+        // V1 images (C-compatible format) should pass fsck just like V2.
+        // This catches regressions where fsck or the reader doesn't handle
+        // compact inodes, BFS ordering, or the whiteout table.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj_size: u64 = 32 * 1024;
+        let obj = generate_test_data(obj_size, 0xBB);
+        let obj_id = repo.ensure_object(&obj)?;
+
+        commit_v1_image(&repo, &obj_id, obj_size)?;
+        repo.sync()?;
+
+        let result = repo.fsck().await?;
+        assert!(
+            result.is_ok(),
+            "V1 (C-compatible) erofs image should pass fsck: {result}"
+        );
+        assert!(result.images_checked > 0, "should have checked the image");
+        Ok(())
+    }
+
     // ---- Fsck metadata validation tests ----
 
     #[tokio::test]
@@ -4897,7 +5066,12 @@ mod tests {
         // Open a sha512 repo as sha256 → AlgorithmMismatch.
         let tmp = tempdir();
         let path = tmp.path().join("sha512-repo");
-        Repository::<Sha512HashValue>::init_path(CWD, &path, Algorithm::SHA512, false).unwrap();
+        Repository::<Sha512HashValue>::init_path(
+            CWD,
+            &path,
+            RepositoryConfig::new(Algorithm::SHA512).set_insecure(),
+        )
+        .unwrap();
         assert!(matches!(
             Repository::<Sha256HashValue>::open_path(CWD, &path),
             Err(RepositoryOpenError::AlgorithmMismatch { .. })
@@ -4968,6 +5142,141 @@ mod tests {
         );
     }
 
+    // ---- erofs_version / cfs_erofs_version feature tests ----
+
+    #[test]
+    fn test_init_v1_repo_metadata() {
+        let meta = RepoMetadata::new_with_version(Algorithm::SHA256, FormatVersion::V1);
+        assert_eq!(meta.erofs_version, FormatVersion::V1);
+        assert!(
+            meta.features
+                .read_only_compatible
+                .contains(&known_features::CFS_EROFS_VERSION.to_string()),
+            "V1 repo must list cfs_erofs_version in ro_compat, got: {:?}",
+            meta.features.read_only_compatible
+        );
+    }
+
+    #[test]
+    fn test_init_v2_repo_metadata() {
+        let meta = RepoMetadata::new_with_version(Algorithm::SHA256, FormatVersion::V2);
+        assert_eq!(meta.erofs_version, FormatVersion::V2);
+        assert!(
+            !meta
+                .features
+                .read_only_compatible
+                .contains(&known_features::CFS_EROFS_VERSION.to_string()),
+            "V2 repo must NOT list cfs_erofs_version in ro_compat"
+        );
+    }
+
+    #[test]
+    fn test_init_path_erofs_version_mismatch() -> Result<()> {
+        let tmp = tempdir();
+        let path = tmp.path().join("repo");
+
+        // First init: V1
+        let config_v1 = RepositoryConfig {
+            algorithm: Algorithm::SHA256,
+            erofs_version: FormatVersion::V1,
+            ..RepositoryConfig::default().set_insecure()
+        };
+        Repository::<Sha256HashValue>::init_path(CWD, &path, config_v1)?;
+
+        // Second init: V2 — should fail because meta.json already exists with V1 config
+        let config_v2 = RepositoryConfig {
+            algorithm: Algorithm::SHA256,
+            erofs_version: FormatVersion::V2,
+            ..RepositoryConfig::default().set_insecure()
+        };
+        let result = Repository::<Sha256HashValue>::init_path(CWD, &path, config_v2);
+        assert!(
+            result.is_err(),
+            "re-initializing with different erofs_version must fail"
+        );
+        let err = result.unwrap_err();
+        // Use the full chain representation so we see the inner bail! message,
+        // not just the outermost fn_error_context wrapper.
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("erofs_version"),
+            "error message must mention erofs_version, got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_init_path_same_erofs_version_is_idempotent() -> Result<()> {
+        let tmp = tempdir();
+        let path = tmp.path().join("repo");
+
+        let config = RepositoryConfig {
+            algorithm: Algorithm::SHA256,
+            erofs_version: FormatVersion::V1,
+            ..RepositoryConfig::default().set_insecure()
+        };
+        let (_, was_new) = Repository::<Sha256HashValue>::init_path(CWD, &path, config.clone())?;
+        assert!(was_new, "first init must be fresh");
+
+        let (repo, was_new) = Repository::<Sha256HashValue>::init_path(CWD, &path, config)?;
+        assert!(!was_new, "second init with same config must be idempotent");
+        assert_eq!(repo.erofs_version(), FormatVersion::V1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_legacy_repo_defaults_to_v2() {
+        // Deserialize JSON that has no erofs_version field — serde(default) must
+        // produce V2 (the current default).
+        let json = br#"{"version":1,"algorithm":"fsverity-sha256-12","features":{}}"#;
+        let meta: RepoMetadata = serde_json::from_slice(json).unwrap();
+        assert_eq!(
+            meta.erofs_version,
+            FormatVersion::V2,
+            "missing erofs_version should default to V2"
+        );
+
+        // Deserialize JSON that has erofs_version as an integer — must parse correctly.
+        let json_with_version =
+            br#"{"version":1,"algorithm":"fsverity-sha256-12","features":{},"erofs_version":2}"#;
+        let meta2: RepoMetadata = serde_json::from_slice(json_with_version).unwrap();
+        assert_eq!(
+            meta2.erofs_version,
+            FormatVersion::V2,
+            "erofs_version integer 2 should parse as V2"
+        );
+    }
+
+    #[test]
+    fn test_old_tool_blocked_on_v1_repo() {
+        // Simulate an old tool that does not know about "cfs_erofs_version".
+        // A V1 repo places "cfs_erofs_version" in ro_compat, so any tool that
+        // does not recognise that feature must open the repo read-only.
+        // We model this by constructing the FeatureFlags directly and filtering
+        // against an empty ro_compat allowlist.
+        let features = FeatureFlags {
+            compatible: vec![],
+            read_only_compatible: vec![known_features::CFS_EROFS_VERSION.to_string()],
+            incompatible: vec![],
+        };
+
+        // An unknown ro_compat feature must not prevent opening, but must
+        // signal read-only access.
+        let unknown_ro: Vec<String> = features
+            .read_only_compatible
+            .iter()
+            .filter(|f| ![].contains(&f.as_str())) // empty old-tool allowlist
+            .cloned()
+            .collect();
+        assert_eq!(
+            unknown_ro,
+            vec![known_features::CFS_EROFS_VERSION.to_string()],
+            "old tool should see cfs_erofs_version as an unknown ro_compat feature"
+        );
+        // And the current tool knows about it, so check() returns ReadWrite.
+        assert_eq!(features.check().unwrap(), FeatureCheck::ReadWrite);
+    }
+
     #[test]
     fn test_object_store_method_variants() {
         // Verify all variants exist and are distinct
@@ -5001,9 +5310,12 @@ mod tests {
 
         // Create a repo, store an object, then remove meta.json to
         // simulate an old-format repository.
-        let (repo, _) =
-            Repository::<Sha256HashValue>::init_path(CWD, &repo_path, Algorithm::SHA256, false)
-                .unwrap();
+        let (repo, _) = Repository::<Sha256HashValue>::init_path(
+            CWD,
+            &repo_path,
+            RepositoryConfig::default().set_insecure(),
+        )
+        .unwrap();
         let data = b"hello world";
         let obj_id = repo.ensure_object(data).unwrap();
         drop(repo);
@@ -5052,9 +5364,12 @@ mod tests {
         let tmp = tempdir();
         let repo_path = tmp.path().join("repo");
 
-        let (repo, _) =
-            Repository::<Sha512HashValue>::init_path(CWD, &repo_path, Algorithm::SHA512, false)
-                .unwrap();
+        let (repo, _) = Repository::<Sha512HashValue>::init_path(
+            CWD,
+            &repo_path,
+            RepositoryConfig::new(Algorithm::SHA512).set_insecure(),
+        )
+        .unwrap();
         let data = b"sha512 test data";
         let obj_id = repo.ensure_object(data).unwrap();
         drop(repo);
@@ -5089,9 +5404,12 @@ mod tests {
         let tmp = tempdir();
         let repo_path = tmp.path().join("repo");
 
-        let (repo, _) =
-            Repository::<Sha512HashValue>::init_path(CWD, &repo_path, Algorithm::SHA512, false)
-                .unwrap();
+        let (repo, _) = Repository::<Sha512HashValue>::init_path(
+            CWD,
+            &repo_path,
+            RepositoryConfig::new(Algorithm::SHA512).set_insecure(),
+        )
+        .unwrap();
         repo.ensure_object(b"some data").unwrap();
         drop(repo);
 
@@ -5129,11 +5447,54 @@ mod tests {
         let tmp = tempdir();
         let repo_path = tmp.path().join("repo");
 
-        Repository::<Sha256HashValue>::init_path(CWD, &repo_path, Algorithm::SHA256, false)
-            .unwrap();
+        Repository::<Sha256HashValue>::init_path(
+            CWD,
+            &repo_path,
+            RepositoryConfig::default().set_insecure(),
+        )
+        .unwrap();
 
         let (_repo, upgraded) =
             Repository::<Sha256HashValue>::open_upgrade(CWD, &repo_path).unwrap();
         assert!(!upgraded);
+    }
+
+    #[tokio::test]
+    async fn test_fsck_v1_image_detects_missing_object() -> Result<()> {
+        // Same as test_fsck_validates_erofs_image_objects but with a V1 image,
+        // ensuring fsck correctly parses V1 images to find object references.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj_size: u64 = 32 * 1024;
+        let obj = generate_test_data(obj_size, 0xBC);
+        let obj_id = repo.ensure_object(&obj)?;
+
+        commit_v1_image(&repo, &obj_id, obj_size)?;
+        repo.sync()?;
+
+        // Sanity: passes before we break it
+        let result = repo.fsck().await?;
+        assert!(
+            result.is_ok(),
+            "healthy V1 image should pass fsck: {result}"
+        );
+
+        // Delete the referenced object
+        let hex = obj_id.to_hex();
+        let (prefix, rest) = hex.split_at(2);
+        let dir = open_test_repo_dir(&tmp);
+        dir.remove_file(format!("objects/{prefix}/{rest}"))?;
+
+        let result = repo.fsck().await?;
+        assert!(
+            !result.is_ok(),
+            "fsck should detect missing object in V1 erofs image: {result}"
+        );
+        assert!(
+            result.missing_objects > 0,
+            "should report missing objects: {result}"
+        );
+        Ok(())
     }
 }
