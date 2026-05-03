@@ -4,6 +4,16 @@
 # This builds and tests bootc against the local composefs-rs checkout
 # using bootc's auto-detection of path dependencies via `cargo xtask local-rust-deps`.
 # --------------------------------------------------------------------
+#
+# NOTE: composefs-boot/src/cmdline.rs contains karg parsing logic (ComposefsCmdline,
+# KARG_V1, KARG_V2) that must be kept in sync with bootc's crates/initramfs/src/lib.rs
+# manually, since bootc does not yet depend on composefs-boot directly.  When changing
+# karg handling, verify both sides.  The composefs-rs cmdline.rs is the source of truth.
+#
+# NOTE: cfsctl init now defaults to --erofs v1 (V1-only format set).  bootc needs
+# --erofs dual so that both V1 EROFS (composefs.digest=) and V2 EROFS (composefs=) are
+# generated for each image.  bootc's own init scripts must pass --erofs dual; this
+# Justfile does not inject that flag.
 
 # Configuration variables (override via environment or command line)
 # Example: COMPOSEFS_BOOTC_REF=v1.0.0 just bootc/build
@@ -60,40 +70,56 @@ patch: clone
         exit 1
     fi
 
-    cfs_path="$_COMPOSEFS_SRC/crates/composefs-ctl"
+    cfs_crates="$_COMPOSEFS_SRC/crates"
 
     cd "$COMPOSEFS_BOOTC_PATH"
 
-    # Add or update the [patch] section with a path override
-    patch_value="composefs-ctl = { path = \"${cfs_path}\" } # Patched by composefs-rs"
-    if grep -q '^[[:space:]]*\[patch\."https://github.com/composefs/composefs-rs"\]' Cargo.toml; then
-        # Patch section already exists (uncommented) — replace the composefs-ctl line
-        sed -i '/^[[:space:]]*\[patch\."https:\/\/github.com\/composefs\/composefs-rs"\]/,/^$\|^\[/{
-            s|^composefs-ctl = .*|'"$patch_value"'|
-        }' Cargo.toml
-    else
-        # No patch section yet — append one
-        {
-            echo ''
-            echo '# Patched by composefs-rs CI to test against local composefs-rs'
-            echo '[patch."https://github.com/composefs/composefs-rs"]'
-            echo "$patch_value"
-        } >> Cargo.toml
-    fi
+    # Crates to override: all composefs-rs workspace members that bootc may
+    # depend on directly.  Cargo resolves transitive workspace deps automatically
+    # once any workspace member is patched by path, but direct deps in bootc's
+    # own Cargo.toml need an explicit [patch] entry.  Extra entries for crates
+    # bootc doesn't use yet are harmless (Cargo warns but does not error).
+    #
+    # Two patch-section URLs are written because the canonical repo moved from
+    # github.com/composefs/composefs-rs to github.com/containers/composefs-rs;
+    # bootc's Cargo.toml may use either.  Having both is harmless.
+    local_crates=(composefs composefs-boot composefs-oci composefs-ctl)
 
-    # Patch the workspace lints to allow missing_docs for composefs-rs crates
-    # bootc has workspace.lints.rust.missing_docs = "deny" but composefs-rs has undocumented items
+    _rev=$(git -C "$_COMPOSEFS_SRC" rev-parse HEAD)
+
+    # Build the block of patch entries
+    patch_entries=""
+    for crate in "${local_crates[@]}"; do
+        patch_entries+="${crate} = { path = \"${cfs_crates}/${crate}\" }"$'\n'
+    done
+
+    # Remove any existing composefs-rs [patch] sections (both URLs), then
+    # append fresh ones.  The remove-and-reappend approach is simpler than
+    # trying to surgically update individual lines when the entry count changes.
+    for url in "https://github.com/composefs/composefs-rs" "https://github.com/containers/composefs-rs"; do
+        escaped_url="${url//\//\\/}"
+        sed -i "/^\[patch\.\"${escaped_url}\"\]/,/^$/d" Cargo.toml
+    done
+
+    {
+        echo ''
+        echo "# Patched by composefs-rs at ${_rev}"
+        for url in "https://github.com/composefs/composefs-rs" "https://github.com/containers/composefs-rs"; do
+            echo "[patch.\"${url}\"]"
+            printf '%s' "$patch_entries"
+            echo ''
+        done
+    } >> Cargo.toml
+
+    # Patch the workspace lints to allow missing_docs for composefs-rs crates.
+    # bootc has workspace.lints.rust.missing_docs = "deny" but some composefs-rs
+    # items lack documentation.
     sed -i 's/missing_docs = "deny"/missing_docs = "allow"/' Cargo.toml
 
     # Cargo.lock will be updated on the next build/check.
     # We intentionally don't run `cargo update` here because it rewrites
     # the workspace dependency line in Cargo.toml (replacing git+rev with path).
 
-    # Update the rev comment in the [patch] section so Cargo.toml actually
-    # changes when composefs-rs moves to a new commit.  Since the file is
-    # part of the podman build context this busts the layer cache.
-    _rev=$(git -C "$_COMPOSEFS_SRC" rev-parse HEAD)
-    sed -i "s/^# Patched by composefs-rs.*/# Patched by composefs-rs at ${_rev}/" Cargo.toml
     echo "bootc patched for composefs-rs at ${_rev}"
 
 # Build sealed bootc image using local composefs-rs
@@ -158,6 +184,9 @@ config:
     Environment Variables:
       COMPOSEFS_BOOTC_PATH - Override bootc checkout path
       COMPOSEFS_BOOTC_REF  - Override bootc git ref (branch/tag/PR)
+                             Use this when composefs-rs has API-breaking changes
+                             that require a matching bootc branch, e.g.:
+                               COMPOSEFS_BOOTC_REF=refs/pull/123/head just bootc/build
       COMPOSEFS_BOOTC_REPO - Override bootc git repository
 
     Test Parameters:

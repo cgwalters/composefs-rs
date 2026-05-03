@@ -31,7 +31,7 @@ use composefs::{
     mountcompat::{overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount},
     repository::Repository,
 };
-use composefs_boot::cmdline::get_cmdline_composefs;
+use composefs_boot::cmdline::{ComposefsCmdline, get_cmdline_composefs};
 
 // Config file
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -246,8 +246,24 @@ fn gpt_workaround() -> Result<()> {
     Ok(())
 }
 
-// Try parse cmdline with sha512 digest address first, if failed with invalid length, parse again with legacy sha256 digest address
+// Try parse cmdline using the new ComposefsCmdline enum (handles both composefs.digest= and
+// composefs=), attempting SHA-512 first and falling back to SHA-256 on length mismatch.
 fn parse_image_address(cmdline: &str) -> Result<(String, bool)> {
+    // Try the new ComposefsCmdline enum first (checks composefs.digest= before composefs=).
+    // Both V1 (composefs.digest=) and V2 (composefs=) support '?' prefix for insecure mode.
+    if let Some(karg) = ComposefsCmdline::<Sha512HashValue>::from_cmdline(cmdline)
+        .ok()
+        .flatten()
+    {
+        return Ok((karg.digest().to_hex(), karg.is_insecure()));
+    }
+    if let Some(karg) = ComposefsCmdline::<Sha256HashValue>::from_cmdline(cmdline)
+        .ok()
+        .flatten()
+    {
+        return Ok((karg.digest().to_hex(), karg.is_insecure()));
+    }
+    // Fall back to the legacy parser for better error messages on malformed composefs= values.
     match get_cmdline_composefs::<Sha512HashValue>(cmdline) {
         Ok((id, insecure)) => Ok((id.to_hex(), insecure)),
         Err(e) => {
@@ -332,6 +348,8 @@ mod test {
         for case in failing {
             assert!(parse_image_address(case).is_err())
         }
+
+        // Legacy V2 karg: composefs=<sha256>
         let digest_legacy = "8b7df143d91c716ecfa5fc1730022f6b421b05cedee8fd52b1fc65a96030ad52";
         let cmdline_legacy = &format!("composefs={digest_legacy}");
         let (digest_cmdline_legacy, _) =
@@ -343,11 +361,27 @@ mod test {
         let (parsed_addr_legacy, _) = parse_image_address(cmdline_legacy).unwrap();
         assert_eq!(digest_legacy, parsed_addr_legacy);
 
+        // Legacy V2 karg: composefs=<sha512>
         let digest = "6f06b5e82420abec546d6e6d3ddd612c50cfa9b707c129345b7ec16f456b92fe35df68999b042e1a6a70dfe75f2fed8cf9f67afd0bf08d2374678d75e2f65a02";
         let cmdline = &format!("composefs={digest}");
         let (digest_cmdline, _) = get_cmdline_composefs::<Sha512HashValue>(cmdline).unwrap();
         similar_asserts::assert_eq!(digest_cmdline, Sha512HashValue::from_hex(digest).unwrap());
         let (parsed_addr, _) = parse_image_address(cmdline).unwrap();
         assert_eq!(digest, parsed_addr);
+
+        // New V1 karg: composefs.digest=<sha256>
+        let (parsed_v1_sha256, _) =
+            parse_image_address(&format!("composefs.digest={digest_legacy}")).unwrap();
+        assert_eq!(digest_legacy, parsed_v1_sha256);
+
+        // New V1 karg: composefs.digest=<sha512>
+        let (parsed_v1_sha512, _) =
+            parse_image_address(&format!("composefs.digest={digest}")).unwrap();
+        assert_eq!(digest, parsed_v1_sha512);
+
+        // V1 takes priority when both kargs are present
+        let cmdline_both = format!("composefs={digest_legacy} composefs.digest={digest_legacy}");
+        let (parsed_both, _) = parse_image_address(&cmdline_both).unwrap();
+        assert_eq!(digest_legacy, parsed_both);
     }
 }
