@@ -129,7 +129,10 @@ jobs:
     strategy:
       matrix:
         example:
-          - { dir: 'bls', os: 'arch' }
+          # Disabled: Linux 7.0 kernel regression breaks composefs fsverity boot
+          # ("has no fs-verity digest"); see https://github.com/bootc-dev/bootc/issues/2174
+          # - { dir: 'bls', os: 'arch' }
+          # - { dir: 'uki', os: 'arch' }
           - { dir: 'bls', os: 'fedora' }
           - { dir: 'bls', os: 'fedora-compat' }
           # This one is currently failing, needs debugging
@@ -140,7 +143,6 @@ jobs:
           # We believe it's mount API changes causing /sysroot to be mounted
           # at the wrong place.
           # - { dir: 'bls', os: 'ubuntu' }
-          - { dir: 'uki', os: 'arch' }
           - { dir: 'uki', os: 'fedora' }
           - { dir: 'unified', os: 'fedora' }
           - { dir: 'unified-secureboot', os: 'fedora' }
