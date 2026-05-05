@@ -2,6 +2,7 @@
 name = "splitfdstream"
 description = "Binary format for serializing data with external file descriptor references"
 keywords = ["splitfdstream", "fd", "serialization"]
+publish = false
 
 edition.workspace = true
 license.workspace = true
