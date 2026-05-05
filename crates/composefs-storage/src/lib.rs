@@ -22,7 +22,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use cstorage::Storage;
+//! use composefs_storage::Storage;
 //!
 //! // Discover storage from default locations
 //! let storage = Storage::discover()?;
@@ -34,7 +34,7 @@
 //! for image in storage.list_images()? {
 //!     println!("Image: {}", image.id());
 //! }
-//! # Ok::<(), cstorage::StorageError>(())
+//! # Ok::<(), composefs_storage::StorageError>(())
 //! ```
 //!
 //! # Architecture

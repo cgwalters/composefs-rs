@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use libtest_mimic::{Arguments, Trial};
 
-pub(crate) use integration_tests::{INTEGRATION_TESTS, integration_test};
+pub(crate) use composefs_integration_tests::{INTEGRATION_TESTS, integration_test};
 
 mod tests;
 

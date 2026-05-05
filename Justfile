@@ -14,7 +14,7 @@ build-release:
 
 # Run unit tests (excludes integration-tests crate)
 test:
-    cargo test --workspace --exclude integration-tests
+    cargo test --workspace --exclude composefs-integration-tests
 
 # Run clippy lints
 clippy:
@@ -22,9 +22,9 @@ clippy:
 
 # Verify cfsctl builds with each optional feature combination
 check-feature-combos:
-    cargo clippy -p cfsctl --no-default-features -- -D warnings
-    cargo clippy -p cfsctl --no-default-features --features oci -- -D warnings
-    cargo clippy -p cfsctl --no-default-features --features http -- -D warnings
+    cargo clippy -p composefs-ctl --no-default-features -- -D warnings
+    cargo clippy -p composefs-ctl --no-default-features --features oci -- -D warnings
+    cargo clippy -p composefs-ctl --no-default-features --features http -- -D warnings
     cargo clippy -p composefs-oci -- -D warnings
     cargo clippy -p composefs-oci --features boot -- -D warnings
 
@@ -64,9 +64,9 @@ test-integration *ARGS: build
     set -euo pipefail
     export CFSCTL_PATH=$(pwd)/target/debug/cfsctl
     if command -v cargo-nextest &> /dev/null; then
-        cargo nextest run -p integration-tests -E 'not test(/^privileged_/)' {{ ARGS }}
+        cargo nextest run -p composefs-integration-tests -E 'not test(/^privileged_/)' {{ ARGS }}
     else
-        cargo test -p integration-tests --test cfsctl-integration-tests -- --skip privileged_ {{ ARGS }}
+        cargo test -p composefs-integration-tests --test cfsctl-integration-tests -- --skip privileged_ {{ ARGS }}
     fi
 
 # Build the test container image for VM-based integration tests
@@ -81,9 +81,9 @@ test-integration-vm *ARGS: build _integration-container-build
     export COMPOSEFS_TEST_IMAGE={{_test_image}}
     export CFSCTL_PATH=$(pwd)/target/debug/cfsctl
     if command -v cargo-nextest &> /dev/null; then
-        cargo nextest run -P integration -p integration-tests {{ ARGS }}
+        cargo nextest run -P integration -p composefs-integration-tests {{ ARGS }}
     else
-        cargo test -p integration-tests --test cfsctl-integration-tests -- {{ ARGS }}
+        cargo test -p composefs-integration-tests --test cfsctl-integration-tests -- {{ ARGS }}
     fi
 
 # Install cargo-nextest if not already installed

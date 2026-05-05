@@ -26,7 +26,7 @@
 //! # Example
 //!
 //! ```
-//! use splitfdstream::{SplitfdstreamWriter, SplitfdstreamReader, Chunk};
+//! use composefs_splitfdstream::{SplitfdstreamWriter, SplitfdstreamReader, Chunk};
 //!
 //! // Write a stream with mixed inline and external chunks
 //! let mut buffer = Vec::new();
@@ -93,19 +93,24 @@ pub enum Chunk<'a> {
 /// # Example
 ///
 /// ```
-/// use splitfdstream::SplitfdstreamWriter;
+/// use composefs_splitfdstream::{SplitfdstreamWriter, SplitfdstreamReader, Chunk};
 ///
+/// // Write a stream with mixed inline and external chunks
 /// let mut buffer = Vec::new();
 /// let mut writer = SplitfdstreamWriter::new(&mut buffer);
+/// writer.write_inline(b"inline data").unwrap();
+/// writer.write_external(0).unwrap();  // Reference fd[1]
+/// writer.write_inline(b"more inline").unwrap();
+/// writer.finish().unwrap();
 ///
-/// // Write some inline data
-/// writer.write_inline(b"Hello, world!").unwrap();
-///
-/// // Reference external fd at index 0 (fd[1])
-/// writer.write_external(0).unwrap();
-///
-/// // Finish and get the underlying writer back
-/// let buffer = writer.finish().unwrap();
+/// // Read the stream back
+/// let mut reader = SplitfdstreamReader::new(buffer.as_slice());
+/// while let Some(chunk) = reader.next_chunk().unwrap() {
+///     match chunk {
+///         Chunk::Inline(data) => println!("Inline: {} bytes", data.len()),
+///         Chunk::External(fd_index) => println!("External: fd[{}]", fd_index + 1),
+///     }
+/// }
 /// ```
 #[derive(Debug)]
 pub struct SplitfdstreamWriter<W> {
@@ -171,7 +176,7 @@ impl<W: Write> SplitfdstreamWriter<W> {
 /// # Example
 ///
 /// ```
-/// use splitfdstream::{SplitfdstreamReader, Chunk};
+/// use composefs_splitfdstream::{SplitfdstreamReader, Chunk};
 ///
 /// let data = vec![
 ///     // Inline chunk: prefix = -5, then 5 bytes

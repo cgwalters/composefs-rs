@@ -1,5 +1,5 @@
 [package]
-name = "integration-tests"
+name = "composefs-integration-tests"
 publish = false
 description = "Integration tests for composefs-rs (not published)"
 autobins = false
