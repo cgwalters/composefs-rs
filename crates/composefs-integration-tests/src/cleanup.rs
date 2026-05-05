@@ -4,7 +4,7 @@
 
 use std::process::Command;
 
-use integration_tests::INTEGRATION_TEST_LABEL;
+use composefs_integration_tests::INTEGRATION_TEST_LABEL;
 
 fn main() {
     println!("Cleaning up integration test resources...");

@@ -1,7 +1,6 @@
 [package]
-name = "cfsctl"
+name = "composefs-ctl"
 description = "Command-line utility for composefs"
-default-run = "cfsctl"
 
 edition.workspace = true
 license.workspace = true
@@ -12,6 +11,10 @@ version.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "cfsctl"
+path = "src/main.rs"
 
 [features]
 default = ['pre-6.15', 'oci', 'containers-storage']
@@ -30,7 +33,7 @@ composefs = { workspace = true }
 composefs-boot = { workspace = true }
 composefs-oci = { workspace = true, optional = true, features = ["boot"] }
 composefs-http = { workspace = true, optional = true }
-cstorage = { path = "../cstorage", version = "0.3.0", features = ["userns-helper"], optional = true }
+cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.4.0", features = ["userns-helper"], optional = true }
 env_logger = { version = "0.11.0", default-features = false }
 hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.17.0", default-features = false }

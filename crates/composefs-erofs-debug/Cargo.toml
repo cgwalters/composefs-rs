@@ -1,5 +1,5 @@
 [package]
-name = "erofs-debug"
+name = "composefs-erofs-debug"
 description = "erofs image debugging tool"
 publish = false
 

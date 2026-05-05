@@ -11,7 +11,7 @@ use anyhow::Result;
 use tempfile::TempDir;
 use xshell::{Shell, cmd};
 
-use integration_tests::{build_test_image, cleanup_test_image, create_test_repository};
+use composefs_integration_tests::{build_test_image, cleanup_test_image, create_test_repository};
 
 use crate::integration_test;
 use crate::tests::privileged::{require_privileged, require_userns};

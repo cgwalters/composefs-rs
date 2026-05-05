@@ -41,10 +41,10 @@
 //! Library users must call [`init_if_helper`] early in their `main()` function:
 //!
 //! ```no_run
-//! // This must be called before any other cstorage operations.
+//! // This must be called before any other composefs_storage operations.
 //! // If this process was spawned as a userns helper, it will
 //! // serve requests and exit, never returning.
-//! cstorage::userns_helper::init_if_helper();
+//! composefs_storage::userns_helper::init_if_helper();
 //!
 //! // Normal application code continues here...
 //! ```

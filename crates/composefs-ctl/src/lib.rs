@@ -5,8 +5,8 @@
 //! crate individually.
 //!
 //! ```
-//! use cfsctl::composefs::repository::Repository;
-//! use cfsctl::composefs::fsverity::Sha256HashValue;
+//! use composefs_ctl::composefs::repository::Repository;
+//! use composefs_ctl::composefs::fsverity::Sha256HashValue;
 //!
 //! let repo = Repository::<Sha256HashValue>::open_path(
 //!     rustix::fs::CWD,

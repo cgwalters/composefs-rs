@@ -37,11 +37,14 @@ RUN --mount=type=cache,target=/src/target \
     cargo fetch
 
 # Build cfsctl and integration test binary
+# Two separate invocations: features are scoped to composefs-ctl and must not
+# be passed to composefs-integration-tests, which has no optional features.
 RUN --network=none \
     --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    cargo build --release -p cfsctl --features="${cfsctl_features}" -p integration-tests && \
+    cargo build --release -p composefs-ctl --features="${cfsctl_features}" && \
+    cargo build --release -p composefs-integration-tests && \
     cp /src/target/release/cfsctl /usr/bin/cfsctl && \
     cp /src/target/release/cfsctl-integration-tests /usr/bin/cfsctl-integration-tests
 
