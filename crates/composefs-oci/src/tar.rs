@@ -203,6 +203,26 @@ pub async fn split_async<ObjectID: FsVerityHashValue>(
             }
             ParseEvent::End { consumed } => {
                 builder.push_inline(&buf.split_to(consumed));
+                // GNU tar pads archives to a "record size" (typically 20×512 = 10240 bytes).
+                // After the two end-of-archive zero blocks (consumed above), there may be
+                // additional zero-padding blocks before EOF. We must store them to reproduce
+                // the original byte stream faithfully for diff_id checksum verification.
+                //
+                // Note: ideally tar-core would surface these extra bytes through
+                // ParseEvent::End::consumed so callers don't need to know about record
+                // granularity; this drain is a workaround until that is addressed upstream.
+                // See https://github.com/composefs/tar-core/pull/24 which will obviate this.
+                if !buf.is_empty() {
+                    builder.push_inline(&buf.split());
+                }
+                loop {
+                    buf.reserve(IO_BUF_CAPACITY);
+                    let n = tar_stream.read_buf(&mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    builder.push_inline(&buf.split());
+                }
                 break;
             }
             ParseEvent::SparseEntry { .. } => {
@@ -580,6 +600,56 @@ mod tests {
         )
         .unwrap();
         assert!(get_entry(&mut reader).unwrap().is_none());
+    }
+
+    /// Verify that a tar without any trailing record padding survives a byte-exact
+    /// roundtrip.  This is the common case for tars produced by the Rust `tar` crate
+    /// and most standard tooling; it forms a baseline paired with the padding test below.
+    #[test]
+    fn test_no_record_padding_roundtrip() {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar_data);
+            append_file(&mut builder, "hello.txt", b"hello world").unwrap();
+            builder.finish().unwrap();
+        }
+        // Confirm the Rust tar crate did not add GNU record padding.
+        const GNU_RECORD_SIZE: usize = 20 * 512;
+        assert_ne!(
+            tar_data.len() % GNU_RECORD_SIZE,
+            0,
+            "expected tar without GNU record padding for this test"
+        );
+        roundtrip_tar_bytes(&tar_data);
+    }
+
+    /// Verify that GNU-style record padding (zero bytes after the two end-of-archive
+    /// blocks, filling the archive out to a 20×512 record boundary) is preserved
+    /// byte-for-bit through split_async → cat().  Without the fix, the reconstructed
+    /// tar was shorter than the original, causing diff_id checksum failures for images
+    /// produced by umoci/Rockcraft (e.g. Ubuntu 26.04).
+    #[test]
+    fn test_gnu_record_padding_roundtrip() {
+        const GNU_RECORD_SIZE: usize = 20 * 512; // 10240 bytes
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar_data);
+            append_file(&mut builder, "hello.txt", b"hello world").unwrap();
+            builder.finish().unwrap();
+        }
+
+        // Simulate GNU record padding: extend to the next record boundary with zeros.
+        let remainder = tar_data.len() % GNU_RECORD_SIZE;
+        if remainder != 0 {
+            tar_data.resize(tar_data.len() + (GNU_RECORD_SIZE - remainder), 0);
+        }
+
+        // The tar length must now be a multiple of the record size.
+        assert_eq!(tar_data.len() % GNU_RECORD_SIZE, 0);
+
+        // roundtrip_tar_bytes asserts byte-exact reproduction through the splitstream.
+        roundtrip_tar_bytes(&tar_data);
     }
 
     #[tokio::test]
@@ -1387,6 +1457,37 @@ mod tests {
         assert_eq!(entries[0].path, PathBuf::from(format!("/{full_path}")));
     }
 
+    /// Byte-exact roundtrip: original tar bytes -> split_async -> splitstream -> cat()
+    /// -> assert bytes match. Catches any corruption in either the inline or
+    /// external code paths, including missing padding or off-by-one errors.
+    fn roundtrip_tar_bytes(tar_data: &[u8]) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let repo = create_test_repository().unwrap();
+            let (object_id, _stats) = split_async(tar_data, repo.clone(), TAR_LAYER_CONTENT_TYPE)
+                .await
+                .unwrap();
+
+            let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
+                repo.open_object(&object_id).unwrap().into(),
+                Some(TAR_LAYER_CONTENT_TYPE),
+            )
+            .unwrap();
+
+            let mut reassembled = Vec::new();
+            reader.cat(&repo, &mut reassembled).unwrap();
+            assert_eq!(
+                reassembled.len(),
+                tar_data.len(),
+                "reassembled tar length mismatch"
+            );
+            assert_eq!(
+                reassembled, tar_data,
+                "reassembled tar bytes differ from original"
+            );
+        });
+    }
+
     /// Property-based tests for tar path handling.
     mod proptest_tests {
         use super::*;
@@ -1525,38 +1626,6 @@ mod tests {
                 builder.finish().unwrap();
             }
             tar_data
-        }
-
-        /// Byte-exact roundtrip: original tar -> split_async -> splitstream -> cat()
-        /// -> assert bytes match. Catches any corruption in either the inline or
-        /// external code paths, including missing padding or off-by-one errors.
-        fn roundtrip_tar_bytes(tar_data: &[u8]) {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let repo = create_test_repository().unwrap();
-                let (object_id, _stats) =
-                    split_async(tar_data, repo.clone(), TAR_LAYER_CONTENT_TYPE)
-                        .await
-                        .unwrap();
-
-                let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
-                    repo.open_object(&object_id).unwrap().into(),
-                    Some(TAR_LAYER_CONTENT_TYPE),
-                )
-                .unwrap();
-
-                let mut reassembled = Vec::new();
-                reader.cat(&repo, &mut reassembled).unwrap();
-                assert_eq!(
-                    reassembled.len(),
-                    tar_data.len(),
-                    "reassembled tar length mismatch"
-                );
-                assert_eq!(
-                    reassembled, tar_data,
-                    "reassembled tar bytes differ from original"
-                );
-            });
         }
 
         proptest! {
