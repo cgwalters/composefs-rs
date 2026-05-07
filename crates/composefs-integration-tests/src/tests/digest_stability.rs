@@ -56,8 +56,24 @@ const CENTOS_BOOTC: ContainerImage = ContainerImage {
     ),
 };
 
+// Ubuntu 26.04 (resolute), pinned by manifest digest.
+// Mirrored from docker.io/library/ubuntu via ci/fixture-images.txt.
+// Ubuntu 26.04 uses umoci/PAX format tars produced by Rockcraft, which emit
+// GNU-style record padding after the end-of-archive blocks.  This exercises
+// the trailing-padding preservation fix in split_async() — without it the
+// reconstructed tar is shorter than the original and the diff_id checksum
+// fails in the @digest code path of create_filesystem().
+const UBUNTU_RESOLUTE: ContainerImage = ContainerImage {
+    label: "ubuntu-resolute",
+    image_ref: "docker://ghcr.io/composefs/ci-fixture-ubuntu-resolute:26.04-d31acef2",
+    upstream_ref: "docker://docker.io/library/ubuntu@sha256:d31acef2a964b6df1f2b7e20a1525c4f2378024e087a4f8a8a9a4247e6a79573",
+    expected_id: "150caabb982d7005db1a1d0480d57a95e84b160aa2b1159f9aae66e92ba07b36\
+                  11ea38e1836eff923dc3a1a617c18494757be0f5e3db16cc7a522981b3f42d40",
+    expected_bootable_id: None,
+};
+
 /// All container images to test.
-const CONTAINER_IMAGES: &[&ContainerImage] = &[&UBI10, &CENTOS_BOOTC];
+const CONTAINER_IMAGES: &[&ContainerImage] = &[&UBI10, &CENTOS_BOOTC, &UBUNTU_RESOLUTE];
 
 /// Return `true` if network tests should be skipped.
 fn skip_network() -> bool {

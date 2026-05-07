@@ -16,3 +16,9 @@ docker://registry.access.redhat.com/ubi10/ubi:10.1-1772441712 docker://ghcr.io/c
 # centos-bootc stream10, pinned by manifest digest.
 # Used in: crates/integration-tests/src/tests/digest_stability.rs
 docker://quay.io/centos-bootc/centos-bootc@sha256:d1913e3d616b9acb7fc2e3331be8baf844048bca2681a23d34e53e75eb18f3d0 docker://ghcr.io/composefs/ci-fixture-centos-bootc:stream10-d1913e3d
+
+# Ubuntu 26.04 (resolute), pinned by manifest digest.
+# Uses umoci/PAX format tars with GNU record padding — specifically exercises
+# the trailing-padding preservation fix in split_async().
+# Used in: crates/integration-tests/src/tests/digest_stability.rs
+docker://docker.io/library/ubuntu@sha256:d31acef2a964b6df1f2b7e20a1525c4f2378024e087a4f8a8a9a4247e6a79573 docker://ghcr.io/composefs/ci-fixture-ubuntu-resolute:26.04-d31acef2
