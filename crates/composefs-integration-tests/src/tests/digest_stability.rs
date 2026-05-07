@@ -9,8 +9,17 @@ use crate::{cfsctl, integration_test};
 struct ContainerImage {
     /// Human-readable label for test output.
     label: &'static str,
-    /// OCI image reference (docker:// prefix).
+    /// Primary OCI image reference — the ghcr.io mirror (docker:// prefix).
+    ///
+    /// The mirror is populated by the `mirror-fixture-images.yml` workflow after
+    /// a PR that adds a new entry to `ci/fixture-images.txt` is merged to main.
+    /// During the PR itself the mirror does not exist yet, so the test falls back
+    /// to `upstream_ref` when this pull fails.
     image_ref: &'static str,
+    /// Upstream OCI image reference used as a fallback when `image_ref` is
+    /// unavailable (e.g. a PR that adds a new mirror entry before it has been
+    /// pushed).  Should be pinned by digest for reproducibility.
+    upstream_ref: &'static str,
     /// Expected composefs image ID without `--bootable`.
     expected_id: &'static str,
     /// Expected composefs image ID with `--bootable`, or `None` if the
@@ -25,6 +34,7 @@ struct ContainerImage {
 const UBI10: ContainerImage = ContainerImage {
     label: "ubi10",
     image_ref: "docker://ghcr.io/composefs/ci-fixture-ubi10:10.1-1772441712",
+    upstream_ref: "docker://registry.access.redhat.com/ubi10/ubi:10.1-1772441712",
     expected_id: "ff8dad033a3e6015d63d6b00c16918da27bf96cc8ddd824e521549db01013227\
                   87c30a3f49e5716f8f6052d78b46308dfaaccf0dfc504d26fe58d468810c0b0e",
     expected_bootable_id: None,
@@ -37,6 +47,7 @@ const UBI10: ContainerImage = ContainerImage {
 const CENTOS_BOOTC: ContainerImage = ContainerImage {
     label: "centos-bootc",
     image_ref: "docker://ghcr.io/composefs/ci-fixture-centos-bootc:stream10-d1913e3d",
+    upstream_ref: "docker://quay.io/centos-bootc/centos-bootc@sha256:d1913e3d616b9acb7fc2e3331be8baf844048bca2681a23d34e53e75eb18f3d0",
     expected_id: "ad575e0570dfb74cbc837f41715d3fba890dd983d992332eaeee93493ce112ee\
                   50d3dc5f6f2a3214cc92412fe3ae936e2e9c0eac24ea787e83ef13c0a718a193",
     expected_bootable_id: Some(
@@ -54,7 +65,38 @@ fn skip_network() -> bool {
 }
 
 /// Pull an OCI image and return the config digest from the pull output.
+///
+/// Tries `image.image_ref` (the ghcr.io mirror) first.  If that fails —
+/// which is expected for PRs that add a new mirror entry before it has been
+/// pushed — falls back to `image.upstream_ref` with a warning.
 fn pull_image(
+    sh: &Shell,
+    cfsctl: &std::path::Path,
+    repo: &std::path::Path,
+    image: &ContainerImage,
+    name: &str,
+) -> Result<String> {
+    let candidates = [(image.image_ref, false), (image.upstream_ref, true)];
+    let mut last_err = None;
+    for (image_ref, is_fallback) in candidates {
+        if is_fallback {
+            eprintln!(
+                "WARNING: mirror pull failed for {}; falling back to upstream {image_ref}",
+                image.label,
+            );
+        }
+        match try_pull_image(sh, cfsctl, repo, image_ref, name) {
+            Ok(config) => return Ok(config),
+            Err(e) => {
+                eprintln!("Pull of {image_ref} failed: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+fn try_pull_image(
     sh: &Shell,
     cfsctl: &std::path::Path,
     repo: &std::path::Path,
@@ -126,7 +168,7 @@ fn test_oci_container_digest_stability() -> Result<()> {
         cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
 
         eprintln!("Pulling {} (this may take a while)...", image.label);
-        let config = pull_image(&sh, &cfsctl, repo, image.image_ref, image.label)?;
+        let config = pull_image(&sh, &cfsctl, repo, image, image.label)?;
 
         // Plain (non-bootable) image ID
         let plain_id = compute_id(&sh, &cfsctl, repo, &config, false)?;
