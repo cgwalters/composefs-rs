@@ -111,8 +111,8 @@ fn open_dir(dirfd: impl AsFd, name: impl AsRef<Path> + Debug) -> rustix::io::Res
     })
 }
 
-fn ensure_dir(dirfd: impl AsFd, name: &str) -> rustix::io::Result<OwnedFd> {
-    match mkdirat(dirfd.as_fd(), name, 0o700.into()) {
+fn ensure_dir(dirfd: impl AsFd, name: &str, mode: Mode) -> rustix::io::Result<OwnedFd> {
+    match mkdirat(dirfd.as_fd(), name, mode) {
         Ok(()) | Err(Errno::EXIST) => {}
         Err(err) => Err(err)?,
     }
@@ -143,8 +143,13 @@ fn mount_tmpfs() -> Result<OwnedFd> {
 }
 
 fn overlay_state(base: impl AsFd, state: impl AsFd, source: &str) -> Result<()> {
-    let upper = ensure_dir(state.as_fd(), "upper")?;
-    let work = ensure_dir(state.as_fd(), "work")?;
+    // upper must be 0755: the overlayfs merged view inherits permissions from
+    // upperdir, so 0700 would make / (or the mounted subdir) inaccessible to
+    // non-root processes (dbus, anything that drops privileges).
+    // work is kernel-internal and never visible in the merged view; 0700 is fine.
+    // See: https://github.com/composefs/composefs-rs/issues/287
+    let upper = ensure_dir(state.as_fd(), "upper", 0o755.into())?;
+    let work = ensure_dir(state.as_fd(), "work", 0o700.into())?;
 
     let overlayfs = FsHandle::open("overlay")?;
     fsconfig_set_string(overlayfs.as_fd(), "source", source)?;
