@@ -56,7 +56,7 @@ impl Stat {
 pub struct LeafId(pub usize);
 
 /// Content types for leaf nodes (non-directory files).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LeafContent<T> {
     /// A regular file with content of type `T`.
     Regular(T),
@@ -91,7 +91,7 @@ impl<T> LeafContent<T> {
 }
 
 /// A leaf node representing a non-directory file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Leaf<T> {
     /// Metadata for this leaf node.
     pub stat: Stat,
@@ -494,6 +494,18 @@ impl<T> Directory<T> {
     /// remains unmodified.
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// Updates a leaf entry in this directory to point to a different [`LeafId`].
+    ///
+    /// Used when breaking a hardlink: after cloning a leaf into a new slot, call
+    /// this to redirect the directory entry to the clone.  Panics if `filename`
+    /// does not exist or is not a leaf.
+    pub fn remap_leaf(&mut self, filename: &OsStr, new_id: LeafId) {
+        match self.entries.get_mut(filename) {
+            Some(Inode::Leaf(id, _)) => *id = new_id,
+            _ => panic!("remap_leaf: {filename:?} is not a leaf entry"),
+        }
     }
 
     /// Recursively finds the newest modification time in this directory tree.

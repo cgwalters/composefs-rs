@@ -249,23 +249,15 @@ fn relabel(stat: &mut Stat, path: &Path, ifmt: u8, policy: &mut Policy) {
     }
 }
 
-fn relabel_leaf<H: FsVerityHashValue>(leaf: &mut Leaf<H>, path: &Path, policy: &mut Policy) {
-    let ifmt = match leaf.content {
-        LeafContent::Regular(..) => b'-',
-        LeafContent::Fifo => b'p', // NB: 'pipe', not 'fifo'
-        LeafContent::Socket => b's',
-        LeafContent::Symlink(..) => b'l',
-        LeafContent::BlockDevice(..) => b'b',
-        LeafContent::CharacterDevice(..) => b'c',
-    };
-    relabel(&mut leaf.stat, path, ifmt, policy);
-}
-
 fn relabel_dir<H: FsVerityHashValue>(
     dir: &mut Directory<H>,
-    leaves: &mut [Leaf<H>],
+    leaves: &mut Vec<Leaf<H>>,
     path: &mut PathBuf,
     policy: &mut Policy,
+    // Tracks the SELinux label committed when a LeafId was first labeled.
+    // `None` means the leaf was labeled but with no security.selinux xattr.
+    // Absence from the map means the leaf hasn't been labeled yet.
+    labeled: &mut HashMap<composefs::generic_tree::LeafId, Option<Box<[u8]>>>,
 ) {
     use composefs::generic_tree::LeafId;
 
@@ -289,11 +281,63 @@ fn relabel_dir<H: FsVerityHashValue>(
         let effective_path = aliased_path.as_deref().unwrap_or(path.as_path());
 
         if let Some(id) = leaf_id {
-            relabel_leaf(&mut leaves[id.0], effective_path, policy);
+            // Compute what label this path would get.
+            let ifmt = match leaves[id.0].content {
+                LeafContent::Regular(..) => b'-',
+                LeafContent::Fifo => b'p',
+                LeafContent::Socket => b's',
+                LeafContent::Symlink(..) => b'l',
+                LeafContent::BlockDevice(..) => b'b',
+                LeafContent::CharacterDevice(..) => b'c',
+            };
+            let new_label: Option<&str> = policy.lookup(effective_path.as_os_str(), ifmt);
+
+            // Check if this LeafId was already labeled (i.e., is a hardlink).
+            let effective_id = if let Some(prev_label) = labeled.get(&id) {
+                // Compare the previously-committed label with the new one.
+                let labels_match = match (prev_label.as_deref(), new_label) {
+                    (Some(p), Some(n)) => p == n.as_bytes(),
+                    (None, None) => true,
+                    _ => false,
+                };
+
+                if labels_match {
+                    // Same label: share the leaf as-is.
+                    id
+                } else {
+                    // Different label: break the hardlink by cloning the leaf
+                    // into a new slot and updating this directory entry to
+                    // point to the clone.
+                    let clone = leaves[id.0].clone();
+                    let new_id = LeafId(leaves.len());
+                    leaves.push(clone);
+                    // Update the directory entry to use the new LeafId.
+                    dir.remap_leaf(name.as_ref(), new_id);
+                    new_id
+                }
+            } else {
+                id
+            };
+
+            // Apply the label to the (possibly cloned) leaf.
+            let key = OsStr::new(XATTR_SECURITY_SELINUX);
+            if let Some(label) = new_label {
+                leaves[effective_id.0]
+                    .stat
+                    .xattrs
+                    .insert(Box::from(key), Box::from(label.as_bytes()));
+            } else {
+                leaves[effective_id.0].stat.xattrs.remove(key);
+            }
+
+            // Record the label committed to this LeafId.
+            labeled
+                .entry(effective_id)
+                .or_insert_with(|| new_label.map(|l| Box::from(l.as_bytes())));
         } else {
             let mut sub_path = effective_path.to_path_buf();
             let subdir = dir.get_directory_mut(name.as_ref()).unwrap();
-            relabel_dir(subdir, leaves, &mut sub_path, policy);
+            relabel_dir(subdir, leaves, &mut sub_path, policy, labeled);
         }
 
         path.pop();
@@ -341,8 +385,9 @@ fn apply_policy<H: FsVerityHashValue>(fs: &mut FileSystem<H>, policy: Option<Pol
     match policy {
         Some(mut policy) => {
             let mut path = PathBuf::from("/");
+            let mut labeled = HashMap::new();
             let FileSystem { root, leaves } = fs;
-            relabel_dir(root, leaves, &mut path, &mut policy);
+            relabel_dir(root, leaves, &mut path, &mut policy, &mut labeled);
             true
         }
         None => {
@@ -451,8 +496,36 @@ mod tests {
 
     use composefs::dumpfile::dumpfile_to_filesystem;
     use composefs::fsverity::Sha256HashValue;
+    use composefs::generic_tree::LeafId;
     use composefs::test::TestRepo;
     use indoc::indoc;
+
+    /// Walk the directory tree and collect every LeafId referenced anywhere in it.
+    fn collect_leaf_ids(dir: &Directory<Sha256HashValue>) -> Vec<LeafId> {
+        let mut ids = Vec::new();
+        for inode in dir.inodes() {
+            match inode {
+                Inode::Directory(sub) => ids.extend(collect_leaf_ids(sub)),
+                Inode::Leaf(id, _) => ids.push(*id),
+            }
+        }
+        ids
+    }
+
+    /// Assert that no LeafId is referenced more than once in the filesystem —
+    /// i.e., after selabel has broken all cross-domain hardlinks, every path
+    /// has its own unique inode.
+    fn assert_no_hardlinks(fs: &FileSystem<Sha256HashValue>) {
+        let ids = collect_leaf_ids(&fs.root);
+        let mut seen = std::collections::HashSet::new();
+        for id in &ids {
+            assert!(
+                seen.insert(id.0),
+                "LeafId {} is shared between two paths after selabel (hardlink not broken)",
+                id.0,
+            );
+        }
+    }
 
     /// Get the SELinux label from a Stat's xattrs, if any.
     fn selinux_label(stat: &Stat) -> Option<String> {
@@ -832,6 +905,148 @@ mod tests {
             get_label(&fs, "/dev/initctl").unwrap(),
             "system_u:object_r:fifo_t:s0"
         );
+    }
+
+    /// Verify that hardlinked files that receive *different* SELinux labels from
+    /// the policy are given independent labels — the hardlink is "broken" in the
+    /// in-memory tree so each path has its own Stat with the correct label.
+    ///
+    /// Without this fix, `selabel` would overwrite the first path's label with the
+    /// second path's label (since both point at the same `leaves[id]` slot).
+    #[test]
+    fn selabel_breaks_hardlinks_with_different_labels() {
+        // /usr/bin/foo gets usr_t, /opt/foo (hardlink) gets opt_t.
+        let file_contexts = indoc! {b"
+            /(/.*)?		system_u:object_r:default_t:s0
+            /usr(/.*)?	system_u:object_r:usr_t:s0
+            /opt(/.*)?	system_u:object_r:opt_t:s0
+        "};
+
+        // /usr/bin/foo is written first (the "original"); /opt/foo is a hardlink.
+        // Note: /etc already exists in the tree (SELinux policy lives there),
+        // so we use /opt as the second directory to avoid conflicts.
+        // The original must appear before the hardlink in dumpfile order.
+        let fs_entries = "\
+/opt 0 40755 2 0 0 0 0.0 - - -
+/usr 0 40755 2 0 0 0 0.0 - - -
+/usr/bin 0 40755 2 0 0 0 0.0 - - -
+/usr/bin/foo 5 100644 2 0 0 0 0.0 - hello -
+/opt/foo 0 @120000 - - - - 0.0 /usr/bin/foo - -
+";
+        let mut fs = build_fs_with_selinux(file_contexts, &[], fs_entries);
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(selabel(&mut fs, &test_repo.repo).unwrap());
+
+        // Each path must carry its own correct label.
+        assert_eq!(
+            get_label(&fs, "/usr/bin/foo"),
+            Some("system_u:object_r:usr_t:s0".into()),
+            "/usr/bin/foo should have usr_t"
+        );
+        assert_eq!(
+            get_label(&fs, "/opt/foo"),
+            Some("system_u:object_r:opt_t:s0".into()),
+            "/opt/foo should have opt_t"
+        );
+
+        // After breaking the hardlink the two entries must refer to *different* LeafIds.
+        let usr_bin = fs.as_dir().get_directory_ref("usr/bin".as_ref()).unwrap();
+        let opt = fs.as_dir().get_directory_ref("opt".as_ref()).unwrap();
+        let foo_usr_id = match usr_bin.lookup(OsStr::new("foo")).unwrap() {
+            Inode::Leaf(id, _) => *id,
+            _ => panic!("expected leaf"),
+        };
+        let foo_opt_id = match opt.lookup(OsStr::new("foo")).unwrap() {
+            Inode::Leaf(id, _) => *id,
+            _ => panic!("expected leaf"),
+        };
+        assert_ne!(
+            foo_usr_id, foo_opt_id,
+            "hardlink should have been broken into separate LeafIds"
+        );
+    }
+
+    /// Simulate the real-world Fedora/CentOS bootc pattern where RPM packages
+    /// hardlink license files between `/usr/lib/<pkg>/` (gets `lib_t`) and
+    /// `/usr/share/licenses/<pkg>/` (gets `usr_t`).
+    ///
+    /// After selabel the filesystem must contain **no hardlinks at all** —
+    /// every path must reference its own unique LeafId so that each file
+    /// carries the label dictated by its own location.
+    ///
+    /// This is the pattern observed in `ghcr.io/bootc-dev/dev-bootc:fedora-44-uki`
+    /// where ~70 files triggered the hardlink-breaking path.
+    #[test]
+    fn selabel_no_hardlinks_after_labeling_bootable_layout() {
+        // Approximate the Fedora targeted policy distinctions that matter here:
+        //   /usr/lib(/.*)?  -> lib_t   (libraries and their bundled docs)
+        //   /usr/share(/.*)? -> usr_t  (architecture-independent data)
+        let file_contexts = indoc! {b"
+            /(/.*)?                             system_u:object_r:default_t:s0
+            /usr(/.*)?                          system_u:object_r:usr_t:s0
+            /usr/lib(/.*)?                      system_u:object_r:lib_t:s0
+            /usr/share(/.*)?                    system_u:object_r:usr_t:s0
+        "};
+
+        // Three packages, each with a file in /usr/lib/<pkg>/ hardlinked to
+        // /usr/share/licenses/<pkg>/COPYING — exactly the pattern RPM uses to
+        // share identical license text across sub-packages.
+        //
+        // The "primary" inode is listed first (under /usr/lib); the
+        // /usr/share/licenses entry is a hardlink (@120000 notation) back to it.
+        let fs_entries = "\
+/usr 0 40755 2 0 0 0 0.0 - - -
+/usr/lib 0 40755 2 0 0 0 0.0 - - -
+/usr/lib/pkgA 0 40755 2 0 0 0 0.0 - - -
+/usr/lib/pkgA/COPYING 674 100644 2 0 0 0 0.0 - GPL2 -
+/usr/lib/pkgB 0 40755 2 0 0 0 0.0 - - -
+/usr/lib/pkgB/COPYING 674 100644 2 0 0 0 0.0 - GPL2 -
+/usr/lib/pkgC 0 40755 2 0 0 0 0.0 - - -
+/usr/lib/pkgC/COPYING 1024 100644 2 0 0 0 0.0 - APACHE2 -
+/usr/share 0 40755 2 0 0 0 0.0 - - -
+/usr/share/licenses 0 40755 2 0 0 0 0.0 - - -
+/usr/share/licenses/pkgA 0 40755 2 0 0 0 0.0 - - -
+/usr/share/licenses/pkgA/COPYING 0 @120000 - - - - 0.0 /usr/lib/pkgA/COPYING - -
+/usr/share/licenses/pkgB 0 40755 2 0 0 0 0.0 - - -
+/usr/share/licenses/pkgB/COPYING 0 @120000 - - - - 0.0 /usr/lib/pkgB/COPYING - -
+/usr/share/licenses/pkgC 0 40755 2 0 0 0 0.0 - - -
+/usr/share/licenses/pkgC/COPYING 0 @120000 - - - - 0.0 /usr/lib/pkgC/COPYING - -
+";
+        let mut fs = build_fs_with_selinux(file_contexts, &[], fs_entries);
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(selabel(&mut fs, &test_repo.repo).unwrap());
+
+        // The /usr/lib files get lib_t; the /usr/share/licenses files get usr_t.
+        assert_eq!(
+            get_label(&fs, "/usr/lib/pkgA/COPYING"),
+            Some("system_u:object_r:lib_t:s0".into()),
+        );
+        assert_eq!(
+            get_label(&fs, "/usr/share/licenses/pkgA/COPYING"),
+            Some("system_u:object_r:usr_t:s0".into()),
+        );
+        assert_eq!(
+            get_label(&fs, "/usr/lib/pkgB/COPYING"),
+            Some("system_u:object_r:lib_t:s0".into()),
+        );
+        assert_eq!(
+            get_label(&fs, "/usr/share/licenses/pkgB/COPYING"),
+            Some("system_u:object_r:usr_t:s0".into()),
+        );
+        assert_eq!(
+            get_label(&fs, "/usr/lib/pkgC/COPYING"),
+            Some("system_u:object_r:lib_t:s0".into()),
+        );
+        assert_eq!(
+            get_label(&fs, "/usr/share/licenses/pkgC/COPYING"),
+            Some("system_u:object_r:usr_t:s0".into()),
+        );
+
+        // The target filesystem must not contain any residual hardlinks —
+        // every path must have its own unique leaf so each can carry its own label.
+        assert_no_hardlinks(&fs);
     }
 
     /// Verify that selabel() overwrites pre-existing labels with the policy's
