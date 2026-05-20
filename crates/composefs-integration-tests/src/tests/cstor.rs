@@ -92,8 +92,14 @@ fn privileged_test_cstor_vs_skopeo_equivalence() -> Result<()> {
         // Import from the OCI directory via skopeo/tar path
         let skopeo_image_ref = format!("oci:{}:test", oci_path.display());
         println!("Importing via skopeo/OCI: {}", skopeo_image_ref);
-        let (skopeo_pull_result, _skopeo_stats) =
-            composefs_oci::pull_image(&skopeo_repo, &skopeo_image_ref, None, None).await?;
+        let (skopeo_pull_result, _skopeo_stats) = composefs_oci::pull_image(
+            &skopeo_repo,
+            &skopeo_image_ref,
+            None,
+            None,
+            std::sync::Arc::new(composefs_oci::NullReporter),
+        )
+        .await?;
         let (skopeo_config_digest, skopeo_config_verity) = skopeo_pull_result.into_config();
 
         // Get layer maps from both configs

@@ -18,7 +18,6 @@ use containers_image_proxy::{
     ConvertedLayerInfo, ImageProxy, ImageProxyConfig, ImageReference, OpenedImage, Transport,
 };
 use fn_error_context::context;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use rustix::process::geteuid;
 use tokio::{io::AsyncReadExt, sync::Semaphore, task::JoinSet};
@@ -33,6 +32,7 @@ use crate::{
     layer::{decompress_async, import_tar_async, is_tar_media_type, store_blob_async},
     layer_identifier,
     oci_image::{manifest_identifier, tag_image},
+    progress::{ComponentId, ProgressEvent, ProgressRead, ProgressUnit, SharedReporter},
 };
 
 /// Result of pulling an OCI image.
@@ -75,7 +75,7 @@ struct ImageOp<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
     proxy: ImageProxy,
     img: OpenedImage,
-    progress: MultiProgress,
+    reporter: SharedReporter,
     transport: Transport,
 }
 
@@ -84,6 +84,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         repo: &Arc<Repository<ObjectID>>,
         image_ref: &ImageReference,
         img_proxy_config: Option<ImageProxyConfig>,
+        reporter: SharedReporter,
     ) -> Result<Self> {
         // Fail fast if the repository is not writable, before starting
         // the image proxy or doing any network I/O.
@@ -142,12 +143,11 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             .open_image_ref(image_ref)
             .await
             .context("Opening image")?;
-        let progress = MultiProgress::new();
         Ok(ImageOp {
             repo: Arc::clone(repo),
             proxy,
             img,
-            progress,
+            reporter,
             transport,
         })
     }
@@ -165,8 +165,9 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         let content_id = layer_identifier(diff_id);
 
         if let Some(layer_id) = self.repo.has_stream(&content_id)? {
-            self.progress
-                .println(format!("Already have layer {diff_id}"))?;
+            self.reporter.report(ProgressEvent::Skipped {
+                id: ComponentId::from(diff_id.to_string()),
+            });
             Ok((layer_id, ImportStats::default()))
         } else {
             // Otherwise, we need to fetch it...
@@ -197,21 +198,40 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             // See https://github.com/containers/containers-image-proxy-rs/issues/71
             let blob_reader = blob_reader.take(descriptor.size());
 
-            let bar = self.progress.add(ProgressBar::new(descriptor.size()));
-            bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
-                .unwrap()
-                .progress_chars("##-"));
-            let progress = bar.wrap_async_read(blob_reader);
-            self.progress.println(format!("Fetching layer {diff_id}"))?;
+            let id = ComponentId::from(diff_id.to_string());
+            self.reporter.report(ProgressEvent::Started {
+                id: id.clone(),
+                total: Some(descriptor.size()),
+                unit: ProgressUnit::Bytes,
+            });
+
+            // Wrap the blob reader to emit Progress events as compressed bytes are read.
+            // This sits before decompression so `fetched` tracks bytes-over-the-wire,
+            // matching the `total` from the descriptor size above.
+            //
+            // The watch channel provides backpressure: if the renderer is slow, intermediate
+            // byte counts are coalesced rather than queued, keeping the I/O path non-blocking.
+            let (blob_reader, progress_driver) = ProgressRead::new(
+                blob_reader,
+                Arc::clone(&self.reporter),
+                id.clone(),
+                Some(descriptor.size()),
+            );
 
             let media_type = descriptor.media_type();
             let (object_id, layer_stats) = if is_tar_media_type(media_type) {
-                // Tar layers: decompress and split into a splitstream
-                let reader = decompress_async(progress, media_type)?;
-                import_tar_async(self.repo.clone(), reader).await?
+                // Tar layers: decompress and split into a splitstream.
+                // Run the progress driver concurrently with the import.
+                let reader = decompress_async(blob_reader, media_type)?;
+                let (result, ()) =
+                    tokio::join!(import_tar_async(self.repo.clone(), reader), progress_driver);
+                result?
             } else {
-                // Non-tar layers (OCI artifacts): stream raw bytes to object store
-                let (object_id, size, method) = store_blob_async(&self.repo, progress).await?;
+                // Non-tar layers (OCI artifacts): stream raw bytes to object store.
+                // Run the progress driver concurrently with the blob store.
+                let (store_result, ()) =
+                    tokio::join!(store_blob_async(&self.repo, blob_reader), progress_driver);
+                let (object_id, size, method) = store_result?;
                 driver.await?;
 
                 let mut stats = ImportStats::default();
@@ -237,6 +257,10 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 stream.add_external_size(size);
                 stream.write_reference(object_id)?;
                 let stream_id = self.repo.write_stream(stream, &content_id, None)?;
+                self.reporter.report(ProgressEvent::Done {
+                    id,
+                    transferred: size,
+                });
                 return Ok((stream_id, stats));
             };
 
@@ -248,6 +272,11 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             self.repo
                 .register_stream(&object_id, &content_id, None)
                 .await?;
+
+            self.reporter.report(ProgressEvent::Done {
+                id,
+                transferred: descriptor.size(),
+            });
 
             Ok((object_id, layer_stats))
         }
@@ -268,8 +297,9 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 
         if let Some(config_id) = self.repo.has_stream(&content_id)? {
             // We already got this config - need to read the layer refs and diff_ids from it
-            self.progress
-                .println(format!("Already have container config {config_digest}"))?;
+            self.reporter.report(ProgressEvent::Message(format!(
+                "Already have container config {config_digest}"
+            )));
 
             let (data, named_refs) = crate::oci_image::read_external_splitstream(
                 &self.repo,
@@ -310,8 +340,9 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             ))
         } else {
             // We need to add the config to the repo
-            self.progress
-                .println(format!("Fetching config {config_digest}"))?;
+            self.reporter.report(ProgressEvent::Message(format!(
+                "Fetching config {config_digest}"
+            )));
 
             let (mut config, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
             let config = async move {
@@ -433,12 +464,14 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 
         let manifest_content_id = manifest_identifier(&manifest_digest);
         let manifest_verity = if let Some(verity) = self.repo.has_stream(&manifest_content_id)? {
-            self.progress
-                .println(format!("Already have manifest {manifest_digest}"))?;
+            self.reporter.report(ProgressEvent::Message(format!(
+                "Already have manifest {manifest_digest}"
+            )));
             verity
         } else {
-            self.progress
-                .println(format!("Storing manifest {manifest_digest}"))?;
+            self.reporter.report(ProgressEvent::Message(format!(
+                "Storing manifest {manifest_digest}"
+            )));
 
             let mut splitstream = self.repo.create_stream(OCI_MANIFEST_CONTENT_TYPE)?;
 
@@ -483,6 +516,7 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
+    reporter: SharedReporter,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
     // Fail fast if the repository is not writable, before doing any I/O.
     repo.ensure_writable()?;
@@ -494,10 +528,10 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     let (result, stats) = if image_ref.transport == Transport::OciDir {
         let (path_str, layout_tag) = crate::oci_layout::parse_oci_layout_ref(&image_ref.name);
         let layout_path = std::path::Path::new(path_str);
-        crate::oci_layout::import_oci_layout(repo, layout_path, layout_tag).await?
+        crate::oci_layout::import_oci_layout(repo, layout_path, layout_tag, reporter).await?
     } else {
         // Standard path: use skopeo proxy for other transports
-        let op = Arc::new(ImageOp::new(repo, &image_ref, img_proxy_config).await?);
+        let op = Arc::new(ImageOp::new(repo, &image_ref, img_proxy_config, reporter).await?);
         op.pull()
             .await
             .with_context(|| format!("Unable to pull container image {imgref}"))?
@@ -534,7 +568,8 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<(OciDigest, ObjectID, ImportStats)> {
-    let (result, stats) = pull_image(repo, imgref, reference, img_proxy_config).await?;
+    let reporter = Arc::new(crate::progress::NullReporter);
+    let (result, stats) = pull_image(repo, imgref, reference, img_proxy_config, reporter).await?;
     let (config_digest, config_verity) = result.into_config();
     Ok((config_digest, config_verity, stats))
 }

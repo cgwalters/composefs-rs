@@ -44,7 +44,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use indicatif::{ProgressBar, ProgressStyle};
 
 use composefs::{
     INLINE_CONTENT_MAX_V0,
@@ -61,6 +60,7 @@ use cstorage::{
 pub use cstorage::init_if_helper;
 
 use crate::oci_image::manifest_identifier;
+use crate::progress::{ComponentId, ProgressEvent, ProgressUnit, SharedReporter};
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::{ContentAndVerity, ImportStats, OciDigest, config_identifier, layer_identifier};
 
@@ -98,6 +98,7 @@ pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
     zerocopy: bool,
     storage_root: Option<&std::path::Path>,
     additional_image_stores: &[&std::path::Path],
+    reporter: SharedReporter,
 ) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
     // Check if we can access files directly or need a proxy
     if can_bypass_file_permissions() {
@@ -119,6 +120,7 @@ pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
                 zerocopy,
                 storage_root.as_deref(),
                 &additional_image_stores,
+                reporter,
             )
         })
         .await
@@ -132,7 +134,7 @@ pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
                 "storage_root and additional_image_stores are not supported in rootless mode"
             );
         }
-        import_from_containers_storage_proxied(repo, image_id, reference, zerocopy).await
+        import_from_containers_storage_proxied(repo, image_id, reference, zerocopy, reporter).await
     }
 }
 
@@ -147,6 +149,7 @@ fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
     zerocopy: bool,
     storage_root: Option<&std::path::Path>,
     additional_image_stores: &[std::path::PathBuf],
+    reporter: SharedReporter,
 ) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
     let mut stats = ImportStats::default();
     let mut ctx = ImportContext::default();
@@ -218,43 +221,41 @@ fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
 
     stats.layers = storage_layer_ids.len() as u64;
 
-    // Import each layer with progress bar
-    let progress = ProgressBar::new(storage_layer_ids.len() as u64);
-    progress.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .expect("valid template")
-            .progress_chars("=>-"),
-    );
-
     let mut layer_refs = Vec::with_capacity(storage_layer_ids.len());
     for (storage_layer_id, diff_id) in storage_layer_ids.iter().zip(diff_ids.iter()) {
         let content_id = layer_identifier(diff_id);
-        let diff_id_str: &str = diff_id.as_ref();
-        let short_id = diff_id_str.get(..19).unwrap_or(diff_id_str);
+        let id = ComponentId::from(diff_id.to_string());
 
         let layer_verity = if let Some(existing) = repo.has_stream(&content_id)? {
-            progress.set_message(format!("Already have {short_id}..."));
+            reporter.report(ProgressEvent::Skipped { id });
             stats.layers_already_present += 1;
             existing
         } else {
-            progress.set_message(format!("Importing {short_id}..."));
+            reporter.report(ProgressEvent::Started {
+                id: id.clone(),
+                total: None,
+                unit: ProgressUnit::Bytes,
+            });
             let (layer_store, layer) = stores
                 .iter()
                 .find_map(|s| Layer::open(s, storage_layer_id).ok().map(|l| (s, l)))
                 .with_context(|| format!("Failed to open layer {}", storage_layer_id))?;
             let (verity, layer_stats) =
                 import_layer_direct(repo, layer_store, &layer, diff_id, zerocopy, &mut ctx)?;
+            let bytes = layer_stats.new_bytes();
             stats.merge(&layer_stats);
+            reporter.report(ProgressEvent::Done {
+                id,
+                transferred: bytes,
+            });
             verity
         };
 
         layer_refs.push((diff_id.clone(), layer_verity));
-        progress.inc(1);
     }
-    progress.finish_with_message("Layers imported");
 
-    finalize_import(repo, &image, &layer_refs, reference, &progress, stats)
+    reporter.report(ProgressEvent::Message("Layers imported".to_string()));
+    finalize_import(repo, &image, &layer_refs, reference, &reporter, stats)
 }
 
 /// Proxied (rootless) implementation of containers-storage import.
@@ -266,6 +267,7 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
     image_id: &str,
     reference: Option<&str>,
     zerocopy: bool,
+    reporter: SharedReporter,
 ) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
     let mut stats = ImportStats::default();
     let mut ctx = ImportContext::default();
@@ -306,15 +308,6 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
 
     stats.layers = image_info.storage_layer_ids.len() as u64;
 
-    // Import each layer with progress bar
-    let progress = ProgressBar::new(image_info.storage_layer_ids.len() as u64);
-    progress.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .expect("valid template")
-            .progress_chars("=>-"),
-    );
-
     let mut layer_refs = Vec::with_capacity(image_info.storage_layer_ids.len());
 
     for (storage_layer_id, diff_id) in image_info
@@ -323,15 +316,18 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
         .zip(image_info.layer_diff_ids.iter())
     {
         let content_id = layer_identifier(diff_id);
-        let diff_id_str: &str = diff_id.as_ref();
-        let short_id = diff_id_str.get(..19).unwrap_or(diff_id_str);
+        let id = ComponentId::from(diff_id.to_string());
 
         let layer_verity = if let Some(existing) = repo.has_stream(&content_id)? {
-            progress.set_message(format!("Already have {short_id}..."));
+            reporter.report(ProgressEvent::Skipped { id });
             stats.layers_already_present += 1;
             existing
         } else {
-            progress.set_message(format!("Importing {short_id}..."));
+            reporter.report(ProgressEvent::Started {
+                id: id.clone(),
+                total: None,
+                unit: ProgressUnit::Bytes,
+            });
             let (verity, layer_stats) = import_layer_proxied(
                 repo,
                 &mut proxy,
@@ -342,14 +338,19 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
                 &mut ctx,
             )
             .await?;
+            let bytes = layer_stats.new_bytes();
             stats.merge(&layer_stats);
+            reporter.report(ProgressEvent::Done {
+                id,
+                transferred: bytes,
+            });
             verity
         };
 
         layer_refs.push((diff_id.clone(), layer_verity));
-        progress.inc(1);
     }
-    progress.finish_with_message("Layers imported");
+
+    reporter.report(ProgressEvent::Message("Layers imported".to_string()));
 
     // Config and manifest metadata don't have restrictive file permissions,
     // so we can read them directly without the proxy.
@@ -362,7 +363,7 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
     // Shutdown the proxy before the blocking finalization
     proxy.shutdown().await.context("Failed to shutdown proxy")?;
 
-    finalize_import(repo, &image, &layer_refs, reference, &progress, stats)
+    finalize_import(repo, &image, &layer_refs, reference, &reporter, stats)
 }
 
 /// Create config + manifest splitstreams, generate the EROFS image, and tag.
@@ -378,7 +379,7 @@ fn finalize_import<ObjectID: FsVerityHashValue>(
     image: &Image,
     layer_refs: &[(OciDigest, ObjectID)],
     reference: Option<&str>,
-    progress: &ProgressBar,
+    reporter: &SharedReporter,
     stats: ImportStats,
 ) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
     // Read the raw config JSON bytes from metadata
@@ -391,10 +392,14 @@ fn finalize_import<ObjectID: FsVerityHashValue>(
     let content_id = config_identifier(&config_digest);
 
     let config_verity = if let Some(existing) = repo.has_stream(&content_id)? {
-        progress.println(format!("Already have config {config_digest}"));
+        reporter.report(ProgressEvent::Message(format!(
+            "Already have config {config_digest}"
+        )));
         existing
     } else {
-        progress.println(format!("Creating config splitstream {config_digest}"));
+        reporter.report(ProgressEvent::Message(format!(
+            "Creating config splitstream {config_digest}"
+        )));
         let mut writer = repo.create_stream(OCI_CONFIG_CONTENT_TYPE)?;
 
         for (diff_id, verity) in layer_refs {
@@ -414,10 +419,14 @@ fn finalize_import<ObjectID: FsVerityHashValue>(
 
     let manifest_content_id = manifest_identifier(&manifest_digest);
     let manifest_verity = if let Some(existing) = repo.has_stream(&manifest_content_id)? {
-        progress.println(format!("Already have manifest {manifest_digest}"));
+        reporter.report(ProgressEvent::Message(format!(
+            "Already have manifest {manifest_digest}"
+        )));
         existing
     } else {
-        progress.println(format!("Creating manifest splitstream {manifest_digest}"));
+        reporter.report(ProgressEvent::Message(format!(
+            "Creating manifest splitstream {manifest_digest}"
+        )));
         let mut writer = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE)?;
 
         let config_ref_key = format!("config:{config_digest}");
