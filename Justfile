@@ -40,6 +40,9 @@ fmt:
 check-fuzz:
     cargo check --manifest-path crates/composefs/fuzz/Cargo.toml
 
+# Run unit + non-privileged integration tests (no VM, no root)
+test-all: test test-integration
+
 # Run all checks (clippy + fmt + test + fuzz build)
 check: clippy check-feature-combos fmt-check test check-fuzz
 

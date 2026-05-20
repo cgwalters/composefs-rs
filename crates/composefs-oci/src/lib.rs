@@ -19,6 +19,8 @@ pub mod image;
 pub mod layer;
 pub mod oci_image;
 pub mod oci_layout;
+/// Re-exported from [`composefs::progress`]; use that path directly in new code.
+pub mod progress;
 pub mod skopeo;
 pub mod tar;
 
@@ -70,6 +72,7 @@ pub use oci_image::{
     oci_fsck, oci_fsck_image, remove_referrer, remove_referrers_for_subject, resolve_ref,
     tag_image, untag_image,
 };
+pub use progress::{ComponentId, NullReporter, ProgressEvent, ProgressReporter, SharedReporter};
 pub use skopeo::pull_image;
 
 /// Statistics from an image import operation.
@@ -156,6 +159,22 @@ impl ImportStats {
     }
 }
 
+/// Format a byte count in human-readable form (e.g. "1.23 MiB").
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit_idx = 0;
+    while value >= 1024.0 && unit_idx + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit_idx += 1;
+    }
+    if unit_idx == 0 {
+        format!("{} B", bytes)
+    } else {
+        format!("{:.2} {}", value, UNITS[unit_idx])
+    }
+}
+
 impl std::fmt::Display for ImportStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let has_zerocopy = self.objects_reflinked > 0 || self.objects_hardlinked > 0;
@@ -174,25 +193,13 @@ impl std::fmt::Display for ImportStats {
 
             let mut byte_parts = Vec::new();
             if self.objects_reflinked > 0 {
-                byte_parts.push(format!(
-                    "{} reflinked",
-                    indicatif::HumanBytes(self.bytes_reflinked)
-                ));
+                byte_parts.push(format!("{} reflinked", human_bytes(self.bytes_reflinked)));
             }
             if self.objects_hardlinked > 0 {
-                byte_parts.push(format!(
-                    "{} hardlinked",
-                    indicatif::HumanBytes(self.bytes_hardlinked)
-                ));
+                byte_parts.push(format!("{} hardlinked", human_bytes(self.bytes_hardlinked)));
             }
-            byte_parts.push(format!(
-                "{} copied",
-                indicatif::HumanBytes(self.bytes_copied)
-            ));
-            byte_parts.push(format!(
-                "{} inlined",
-                indicatif::HumanBytes(self.bytes_inlined)
-            ));
+            byte_parts.push(format!("{} copied", human_bytes(self.bytes_copied)));
+            byte_parts.push(format!("{} inlined", human_bytes(self.bytes_inlined)));
             write!(f, "{}", byte_parts.join(", "))
         } else {
             write!(
@@ -200,8 +207,8 @@ impl std::fmt::Display for ImportStats {
                 "{} new + {} already present objects; {} stored, {} inlined",
                 self.objects_copied,
                 self.objects_already_present,
-                indicatif::HumanBytes(self.bytes_copied),
-                indicatif::HumanBytes(self.bytes_inlined),
+                human_bytes(self.bytes_copied),
+                human_bytes(self.bytes_inlined),
             )
         }
     }
@@ -227,7 +234,7 @@ pub enum LocalFetchOpt {
 ///
 /// Use `Default::default()` for the common case (skopeo transport, no
 /// containers-storage import).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct PullOptions<'a> {
     /// Image proxy configuration passed to skopeo (ignored for
     /// `containers-storage:` references when `local_fetch` is not
@@ -248,6 +255,32 @@ pub struct PullOptions<'a> {
     /// `additionalimagestore=` option in containers/storage.
     /// Only relevant when `local_fetch` is not [`Disabled`](LocalFetchOpt::Disabled).
     pub additional_image_stores: &'a [&'a std::path::Path],
+
+    /// Progress reporter for this pull operation.
+    ///
+    /// When `None`, all progress events are silently discarded.  Supply a
+    /// [`SharedReporter`] implementation (e.g. an `indicatif`-backed renderer)
+    /// to receive [`ProgressEvent`]s as the pull proceeds.
+    pub progress: Option<SharedReporter>,
+}
+
+impl<'a> std::fmt::Debug for PullOptions<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PullOptions")
+            .field("img_proxy_config", &self.img_proxy_config)
+            .field("local_fetch", &self.local_fetch)
+            .field("storage_root", &self.storage_root)
+            .field("additional_image_stores", &self.additional_image_stores)
+            .field(
+                "progress",
+                if self.progress.is_some() {
+                    &"Some(<ProgressReporter>)"
+                } else {
+                    &"None"
+                },
+            )
+            .finish()
+    }
 }
 
 /// Result of a pull operation.
@@ -367,6 +400,10 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     reference: Option<&str>,
     opts: PullOptions<'_>,
 ) -> Result<PullResult<ObjectID>> {
+    let reporter: SharedReporter = opts
+        .progress
+        .unwrap_or_else(|| std::sync::Arc::new(NullReporter));
+
     #[cfg(feature = "containers-storage")]
     if opts.local_fetch != LocalFetchOpt::Disabled
         && let Some(image_id) = cstor::parse_containers_storage_ref(imgref)
@@ -380,6 +417,7 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
                 zerocopy,
                 opts.storage_root,
                 opts.additional_image_stores,
+                reporter,
             )
             .await?;
         return Ok(PullResult {
@@ -392,7 +430,7 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     }
 
     let (result, stats) =
-        skopeo::pull_image(repo, imgref, reference, opts.img_proxy_config).await?;
+        skopeo::pull_image(repo, imgref, reference, opts.img_proxy_config, reporter).await?;
     Ok(crate::PullResult {
         manifest_digest: result.manifest_digest,
         manifest_verity: result.manifest_verity,
@@ -809,6 +847,19 @@ mod test {
     use composefs::{fsverity::Sha256HashValue, repository::Repository, test::tempdir};
 
     use super::*;
+
+    #[test]
+    fn test_human_bytes() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1), "1 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.00 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.00 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024 * 1024), "1.00 TiB");
+        // Values above TiB stay in TiB
+        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024 * 1024), "2.00 TiB");
+    }
 
     /// Expected composefs dumpfile output for the base test image created by
     /// [`test_util::create_base_image`]. Used across multiple tests to verify
@@ -2036,5 +2087,205 @@ mod test {
             dump.contains("/etc/hostname"),
             "EROFS should contain hostname"
         );
+    }
+
+    // ── Progress API integration tests ───────────────────────────────────────
+
+    /// Create a minimal OCI layout directory with one (empty) tar layer.
+    ///
+    /// Returns the path to the OCI layout directory. The image is pinned to
+    /// the current host platform so `import_oci_layout` can resolve it.
+    ///
+    /// The layer is an empty tar archive (valid tar, zero entries), which is
+    /// sufficient to exercise the `import_layer_from_file` progress path.
+    fn make_test_oci_layout(parent: &std::path::Path) -> std::path::PathBuf {
+        use cap_std_ext::cap_std;
+        use containers_image_proxy::oci_spec::image::{
+            Arch, ConfigBuilder, ImageConfigurationBuilder, Os, PlatformBuilder, RootFsBuilder,
+        };
+        use ocidir::OciDir;
+
+        let oci_dir = parent.join("oci-layout");
+        std::fs::create_dir_all(&oci_dir).unwrap();
+        let dir =
+            cap_std::fs::Dir::open_ambient_dir(&oci_dir, cap_std::ambient_authority()).unwrap();
+        let ocidir = OciDir::ensure(dir).unwrap();
+
+        let mut manifest = ocidir.new_empty_manifest().unwrap().build().unwrap();
+        let mut config = ImageConfigurationBuilder::default()
+            .architecture(Arch::default())
+            .os(Os::default())
+            .rootfs(
+                RootFsBuilder::default()
+                    .typ("layers")
+                    .diff_ids(Vec::<String>::new())
+                    .build()
+                    .unwrap(),
+            )
+            .config(ConfigBuilder::default().build().unwrap())
+            .build()
+            .unwrap();
+
+        // Create an empty tar layer (finish the builder immediately without adding any entries)
+        let layer = ocidir
+            .create_layer(None)
+            .unwrap()
+            .into_inner()
+            .unwrap()
+            .complete()
+            .unwrap();
+        ocidir.push_layer(&mut manifest, &mut config, layer, "layer", None);
+
+        let platform = PlatformBuilder::default()
+            .architecture(Arch::default())
+            .os(Os::default())
+            .build()
+            .unwrap();
+        ocidir
+            .insert_manifest_and_config(manifest, config, None, platform)
+            .unwrap();
+
+        oci_dir
+    }
+
+    /// Pulling a fresh OCI layout image (no prior cache) must emit at least one
+    /// `Started` event per layer and a matching `Done` event, via the
+    /// `import_oci_layout` fast path.
+    ///
+    /// This is the primary integration test for the progress API: it verifies
+    /// that the oci_layout fast path actually emits events (previously it
+    /// emitted none).
+    #[tokio::test]
+    async fn test_oci_layout_pull_emits_started_and_done() {
+        use crate::oci_layout::import_oci_layout;
+        use crate::progress::ProgressEvent;
+        use crate::progress::test_support::RecordingReporter;
+        use composefs::fsverity::Sha256HashValue;
+        use composefs::test::TestRepo;
+
+        let layout_dir = tempfile::tempdir().unwrap();
+        let layout_path = make_test_oci_layout(layout_dir.path());
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+        let recorder = std::sync::Arc::new(RecordingReporter::new());
+        let reporter: crate::progress::SharedReporter =
+            std::sync::Arc::clone(&recorder) as crate::progress::SharedReporter;
+
+        import_oci_layout(repo, &layout_path, None, reporter)
+            .await
+            .expect("import_oci_layout should succeed");
+
+        let events = recorder.events();
+
+        // There must be at least one Started event
+        let started_count = events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Started { .. }))
+            .count();
+        assert!(
+            started_count >= 1,
+            "expected at least one Started event, got {started_count} (total events: {})",
+            events.len()
+        );
+
+        // Every Started must have a matching Done or Skipped
+        let started_ids: std::collections::HashSet<String> = events
+            .iter()
+            .filter_map(|e| {
+                if let ProgressEvent::Started { id, .. } = e {
+                    Some(id.as_str().to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for started_id in &started_ids {
+            let has_terminal = events.iter().any(|e| match e {
+                ProgressEvent::Done { id, .. } | ProgressEvent::Skipped { id } => {
+                    id.as_str() == started_id
+                }
+                _ => false,
+            });
+            assert!(
+                has_terminal,
+                "Started for '{started_id}' has no matching Done or Skipped"
+            );
+        }
+    }
+
+    /// Re-importing the same OCI layout (layers already cached) must emit
+    /// `Skipped` events rather than `Started`/`Done`.
+    #[tokio::test]
+    async fn test_oci_layout_reimport_emits_skipped() {
+        use crate::oci_layout::import_oci_layout;
+        use crate::progress::test_support::RecordingReporter;
+        use crate::progress::{NullReporter, ProgressEvent};
+        use composefs::fsverity::Sha256HashValue;
+        use composefs::test::TestRepo;
+
+        let layout_dir = tempfile::tempdir().unwrap();
+        let layout_path = make_test_oci_layout(layout_dir.path());
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // First import (populates cache)
+        let null: crate::progress::SharedReporter = std::sync::Arc::new(NullReporter);
+        import_oci_layout(repo, &layout_path, None, null)
+            .await
+            .expect("first import should succeed");
+
+        // Second import (everything already cached)
+        let recorder = std::sync::Arc::new(RecordingReporter::new());
+        let reporter: crate::progress::SharedReporter =
+            std::sync::Arc::clone(&recorder) as crate::progress::SharedReporter;
+        import_oci_layout(repo, &layout_path, None, reporter)
+            .await
+            .expect("second import should succeed");
+
+        let events = recorder.events();
+
+        // On reimport, layers are cached: expect Skipped, not Done
+        let done_count = events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Done { .. }))
+            .count();
+        let skipped_count = events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Skipped { .. }))
+            .count();
+        assert_eq!(
+            done_count, 0,
+            "no Done events expected on reimport (layers cached), got {done_count}"
+        );
+        assert!(
+            skipped_count >= 1,
+            "expected at least one Skipped on reimport, got {skipped_count}"
+        );
+    }
+
+    /// The `import_oci_layout` function with `NullReporter` (via `SharedReporter`
+    /// wrapping `NullReporter`) must not panic now that it uses the reporter internally.
+    ///
+    /// This verifies the zero-overhead default path still works correctly.
+    #[tokio::test]
+    async fn test_import_oci_layout_with_null_reporter_does_not_panic() {
+        use crate::oci_layout::import_oci_layout;
+        use crate::progress::NullReporter;
+        use composefs::fsverity::Sha256HashValue;
+        use composefs::test::TestRepo;
+
+        let layout_dir = tempfile::tempdir().unwrap();
+        let layout_path = make_test_oci_layout(layout_dir.path());
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        // NullReporter: zero overhead, no events collected
+        let reporter: crate::progress::SharedReporter = std::sync::Arc::new(NullReporter);
+        import_oci_layout(repo, &layout_path, None, reporter)
+            .await
+            .expect("import_oci_layout with NullReporter should not panic");
     }
 }
