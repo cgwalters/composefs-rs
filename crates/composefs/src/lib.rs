@@ -14,6 +14,7 @@ pub mod fs;
 pub mod fsverity;
 pub mod mount;
 pub mod mountcompat;
+pub mod progress;
 pub mod repository;
 pub mod splitstream;
 pub mod tree;

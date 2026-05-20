@@ -15,19 +15,53 @@ use std::{
 use anyhow::{Result, bail};
 use bytes::Bytes;
 use composefs::util::DigestWrite;
-use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Client, Response, Url};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 
+use composefs::progress::{ComponentId, NullReporter, ProgressEvent, ProgressUnit, SharedReporter};
 use composefs::{
     fsverity::FsVerityHashValue, repository::Repository, splitstream::SplitStreamReader,
 };
+
+/// Initial number of concurrent HTTP object fetch requests.
+///
+/// Matches the default `SETTINGS_MAX_CONCURRENT_STREAMS` value from RFC 7540
+/// §6.5.2.  This bounds the JoinSet backlog while new tasks are queued as
+/// existing ones complete.
+const INITIAL_CONCURRENT_REQUESTS: usize = 100;
+
+/// Options for a [`download`] operation.
+#[derive(Default)]
+pub struct DownloadOptions {
+    /// Progress reporter for this download operation.
+    ///
+    /// When `None`, all progress events are silently discarded.  Supply a
+    /// [`SharedReporter`] implementation (e.g. an `indicatif`-backed renderer)
+    /// to receive [`ProgressEvent`]s as the download proceeds.
+    pub progress: Option<SharedReporter>,
+}
+
+impl std::fmt::Debug for DownloadOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadOptions")
+            .field(
+                "progress",
+                if self.progress.is_some() {
+                    &"Some(<ProgressReporter>)"
+                } else {
+                    &"None"
+                },
+            )
+            .finish()
+    }
+}
 
 struct Downloader<ObjectID: FsVerityHashValue> {
     client: Client,
     repo: Arc<Repository<ObjectID>>,
     url: Url,
+    reporter: SharedReporter,
 }
 
 impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
@@ -70,15 +104,6 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
     }
 
     async fn ensure_stream(self: &Arc<Self>, name: &str) -> Result<(String, ObjectID)> {
-        let progress = ProgressBar::new(2); // the first object gets "ensured" twice
-        progress.set_style(
-            ProgressStyle::with_template(
-                "[eta {eta}] {bar:40.cyan/blue} Fetching {pos} / {len} splitstreams",
-            )
-            .unwrap()
-            .progress_chars("##-"),
-        );
-
         // Ideally we'll get a symlink, but we might get the data directly
         let (data, is_symlink) = self.fetch("streams/", name).await?;
         let my_id = if is_symlink {
@@ -86,7 +111,10 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
         } else {
             self.repo.ensure_object_async(data.into()).await?
         };
-        progress.inc(1);
+
+        self.reporter.report(ProgressEvent::Message(format!(
+            "Fetching splitstreams for {name}"
+        )));
 
         let mut objects_todo = HashSet::new();
 
@@ -99,9 +127,9 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
         while let Some(id) = splitstreams_todo.pop() {
             // this is the slow part (downloads, writing to disk, etc.)
             if self.ensure_object(&id).await? {
-                progress.inc(1);
-            } else {
-                progress.dec_length(1);
+                self.reporter.report(ProgressEvent::Message(format!(
+                    "Fetched splitstream {id:?}"
+                )));
             }
 
             // this part is fast: it only touches the header
@@ -111,7 +139,6 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
                     // This is the (normal) case if we encounter a splitstream we didn't see yet...
                     None => {
                         splitstreams_todo.push(verity.clone());
-                        progress.inc_length(1);
                     }
 
                     // This is the case where we've already been asked to fetch this stream.  We'll
@@ -143,25 +170,21 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
             })?;
         }
 
-        progress.finish();
-
-        let progress = ProgressBar::new(objects_todo.len() as u64);
-        progress.set_style(
-            ProgressStyle::with_template(
-                "[eta {eta}] {bar:40.cyan/blue} Fetching {pos} / {len} objects",
-            )
-            .unwrap()
-            .progress_chars("##-"),
-        );
+        let objects_total = objects_todo.len() as u64;
+        let fetch_id = ComponentId::from(format!("objects:{name}"));
+        self.reporter.report(ProgressEvent::Started {
+            id: fetch_id.clone(),
+            total: Some(objects_total),
+            unit: ProgressUnit::Items,
+        });
 
         // Fetch all the objects
         let mut set = JoinSet::<Result<bool>>::new();
         let mut iter = objects_todo.into_iter();
+        let mut fetched: u64 = 0;
 
-        // Queue up 100 initial requests
-        // See SETTINGS_MAX_CONCURRENT_STREAMS in RFC 7540
-        // We might actually want to increase this...
-        for id in iter.by_ref().take(100) {
+        // Queue up the initial batch of concurrent requests.
+        for id in iter.by_ref().take(INITIAL_CONCURRENT_REQUESTS) {
             let self_ = Arc::clone(self);
             set.spawn(async move { self_.ensure_object(&id).await });
         }
@@ -171,10 +194,12 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
         while let Some(result) = set.join_next().await {
             if result?? {
                 // a download
-                progress.inc(1);
-            } else {
-                // a not-download
-                progress.dec_length(1);
+                fetched += 1;
+                self.reporter.report(ProgressEvent::Progress {
+                    id: fetch_id.clone(),
+                    fetched,
+                    total: Some(objects_total),
+                });
             }
 
             if let Some(id) = iter.next() {
@@ -183,18 +208,17 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
             }
         }
 
-        progress.finish();
+        self.reporter.report(ProgressEvent::Done {
+            id: fetch_id,
+            transferred: fetched,
+        });
 
         // Now that we have all of the objects, we can verify that the merged-content of each
         // splitstream corresponds to its claimed body content checksum, if any...
-        let progress = ProgressBar::new(splitstreams.len() as u64);
-        progress.set_style(
-            ProgressStyle::with_template(
-                "[eta {eta}] {bar:40.cyan/blue} Verifying {pos} / {len} splitstreams",
-            )
-            .unwrap()
-            .progress_chars("##-"),
-        );
+        self.reporter.report(ProgressEvent::Message(format!(
+            "Verifying {} splitstreams",
+            splitstreams.len()
+        )));
 
         let mut my_sha256 = None;
         // TODO: This can definitely happen in parallel...
@@ -217,11 +241,7 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
             if id == my_id {
                 my_sha256 = Some(measured_checksum);
             }
-
-            progress.inc(1);
         }
-
-        progress.finish();
 
         // We've definitely set this by now: `my_id` is in `splitstreams`.
         let my_sha256 = my_sha256.unwrap();
@@ -241,6 +261,7 @@ impl<ObjectID: FsVerityHashValue> Downloader<ObjectID> {
 /// * `url` - The base HTTP URL where the splitstream repository is hosted
 /// * `name` - The name of the splitstream to download (located under `streams/` on the server)
 /// * `repo` - The repository where downloaded objects will be stored
+/// * `opts` - Download options including an optional progress reporter
 ///
 /// # Returns
 ///
@@ -258,11 +279,15 @@ pub async fn download<ObjectID: FsVerityHashValue>(
     url: &str,
     name: &str,
     repo: Arc<Repository<ObjectID>>,
+    opts: DownloadOptions,
 ) -> Result<(String, ObjectID)> {
+    let reporter: SharedReporter = opts.progress.unwrap_or_else(|| Arc::new(NullReporter));
+
     let downloader = Arc::new(Downloader {
         client: Client::new(),
         repo,
         url: Url::parse(url)?,
+        reporter,
     });
 
     downloader.ensure_stream(name).await
