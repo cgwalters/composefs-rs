@@ -18,10 +18,17 @@ if [ ! -f ${fix_verity_efi} ]; then
     mv "${fix_verity_efi}.tmp" "${fix_verity_efi}"
 fi
 
+ovmf=""
+for p in /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2/x64/OVMF.4m.fd; do
+    if [ -f "$p" ]; then ovmf="$p"; break; fi
+done
+[ -n "$ovmf" ] || { echo "Cannot find OVMF firmware"; exit 1; }
+
 qemu-system-x86_64 \
     -nographic \
     -m 4096 \
     -enable-kvm \
-    -bios /usr/share/edk2/ovmf/OVMF_CODE.fd \
+    -machine q35 \
+    -bios "${ovmf}" \
     -drive file="$1",format=raw,if=virtio,media=disk \
     -kernel "${fix_verity_efi}"
