@@ -34,6 +34,7 @@ use composefs::repository::{ObjectStoreMethod, Repository};
 
 use crate::layer::{decompress_async, import_tar_async, is_tar_media_type, store_blob_async};
 use crate::oci_image::manifest_identifier;
+use crate::progress::{ComponentId, ProgressEvent, ProgressRead, ProgressUnit, SharedReporter};
 use crate::skopeo::OCI_BLOB_CONTENT_TYPE;
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE};
 use crate::{ImportStats, config_identifier, layer_identifier};
@@ -71,12 +72,15 @@ fn resolve_manifest(ocidir: &OciDir, tag: Option<&str>) -> Result<ResolvedManife
 /// Import an image from a local OCI layout directory.
 ///
 /// This is the fast path for `oci:` transport references. It reads the OCI
-/// layout directly without going through skopeo.
+/// layout directly without going through skopeo. Progress events are emitted
+/// via `reporter` using the same `Started`/`Done`/`Skipped` lifecycle as the
+/// skopeo path.
 #[context("Importing OCI layout from {}", layout_path.display())]
 pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     layout_path: &Path,
     layout_tag: Option<&str>,
+    reporter: SharedReporter,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
     // Check writability before touching the source, so a read-only repo gives
     // a clear "not writable" error rather than a misleading source-open error.
@@ -97,10 +101,16 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
     // Import config and layers
     let config_descriptor = manifest.config();
     let layers = manifest.layers();
+    reporter.report(ProgressEvent::Message(format!(
+        "Importing {} layers from OCI layout",
+        layers.len()
+    )));
     let (config_digest, config_verity, layer_refs, stats) =
-        import_config_and_layers(repo, &ocidir, layers, config_descriptor)
+        import_config_and_layers(repo, &ocidir, layers, config_descriptor, &reporter)
             .await
             .with_context(|| format!("Failed to import config {}", config_descriptor.digest()))?;
+
+    reporter.report(ProgressEvent::Message("Storing manifest".to_string()));
 
     // Store the manifest
     let manifest_content_id = manifest_identifier(&manifest_digest);
@@ -150,6 +160,7 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
     ocidir: &OciDir,
     manifest_layers: &[Descriptor],
     config_descriptor: &Descriptor,
+    reporter: &SharedReporter,
 ) -> Result<(OciDigest, ObjectID, Vec<(OciDigest, ObjectID)>, ImportStats)> {
     let config_digest: OciDigest = config_descriptor.digest().clone();
     let content_id = config_identifier(&config_digest);
@@ -191,6 +202,13 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
             layer_refs.len()
         );
 
+        // Emit Skipped for each cached layer so callers can close any open progress bars
+        for (diff_id, _) in &layer_refs {
+            reporter.report(ProgressEvent::Skipped {
+                id: ComponentId::from(diff_id.to_string()),
+            });
+        }
+
         return Ok((config_digest, config_id, layer_refs, ImportStats::default()));
     }
 
@@ -220,17 +238,26 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
         let diff_id = (*diff_id).clone();
         let repo = Arc::clone(repo);
         let permit = Arc::clone(&sem).acquire_owned().await?;
+        let reporter = Arc::clone(reporter);
 
         let layer_file = ocidir
             .read_blob(descriptor)
             .with_context(|| format!("Opening layer blob {}", descriptor.digest()))?;
 
         let media_type = descriptor.media_type().clone();
+        let layer_size = descriptor.size();
 
         layer_tasks.spawn(async move {
             let _permit = permit;
-            let (verity, layer_stats) =
-                import_layer_from_file(&repo, &diff_id, layer_file, &media_type).await?;
+            let (verity, layer_stats) = import_layer_from_file(
+                &repo,
+                &diff_id,
+                layer_file,
+                &media_type,
+                layer_size,
+                &reporter,
+            )
+            .await?;
             anyhow::Ok((idx, diff_id, verity, layer_stats))
         });
     }
@@ -274,30 +301,55 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
 }
 
 /// Import a single layer by streaming from a file handle.
+///
+/// Emits `Started`/`Done` (or `Skipped`) progress events via `reporter`.
 async fn import_layer_from_file<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     diff_id: &OciDigest,
     layer_file: std::fs::File,
     media_type: &MediaType,
+    layer_size: u64,
+    reporter: &SharedReporter,
 ) -> Result<(ObjectID, ImportStats)> {
     let content_id = layer_identifier(diff_id);
+    let id = ComponentId::from(diff_id.to_string());
 
     if let Some(layer_id) = repo.has_stream(&content_id)? {
         debug!("Already have layer {diff_id}");
+        reporter.report(ProgressEvent::Skipped { id });
         return Ok((layer_id, ImportStats::default()));
     }
 
     debug!("Importing layer {diff_id}");
+    reporter.report(ProgressEvent::Started {
+        id: id.clone(),
+        total: Some(layer_size),
+        unit: ProgressUnit::Bytes,
+    });
 
-    // Convert std::fs::File to tokio::fs::File for async I/O
-    let async_file = tokio::fs::File::from_std(layer_file);
+    // Wrap the file reader to emit Progress events as compressed bytes are read.
+    // This sits before decompression so `fetched` tracks bytes-on-disk,
+    // matching the `total` from the descriptor size above.
+    //
+    // The watch channel provides backpressure: if the renderer is slow, intermediate
+    // byte counts are coalesced rather than queued, keeping the I/O path non-blocking.
+    let (async_file, progress_driver) = ProgressRead::new(
+        tokio::fs::File::from_std(layer_file),
+        Arc::clone(reporter),
+        id.clone(),
+        Some(layer_size),
+    );
 
     let (object_id, layer_stats) = if is_tar_media_type(media_type) {
+        // Run the progress driver concurrently with the import.
         let reader = decompress_async(async_file, media_type)?;
-        import_tar_async(repo.clone(), reader).await?
+        let (result, ()) = tokio::join!(import_tar_async(repo.clone(), reader), progress_driver);
+        result?
     } else {
-        // Non-tar blob: store as object and create splitstream wrapper
-        let (object_id, size, method) = store_blob_async(repo, async_file).await?;
+        // Non-tar blob: store as object and create splitstream wrapper.
+        // Run the progress driver concurrently with the blob store.
+        let (store_result, ()) = tokio::join!(store_blob_async(repo, async_file), progress_driver);
+        let (object_id, size, method) = store_result?;
 
         let mut stats = ImportStats::default();
         match method {
@@ -322,18 +374,27 @@ async fn import_layer_from_file<ObjectID: FsVerityHashValue>(
         stream.add_external_size(size);
         stream.write_reference(object_id)?;
         let stream_id = repo.write_stream(stream, &content_id, None)?;
+        reporter.report(ProgressEvent::Done {
+            id,
+            transferred: size,
+        });
         return Ok((stream_id, stats));
     };
 
     // Register the stream with its content identifier
     repo.register_stream(&object_id, &content_id, None).await?;
 
+    reporter.report(ProgressEvent::Done {
+        id,
+        transferred: layer_size,
+    });
     Ok((object_id, layer_stats))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress::NullReporter;
 
     #[test]
     fn test_parse_oci_layout_ref() {
@@ -420,7 +481,8 @@ mod tests {
         .unwrap();
         let repo = std::sync::Arc::new(repo);
 
-        let result = import_oci_layout(&repo, layout_path, None).await;
+        let reporter = std::sync::Arc::new(NullReporter);
+        let result = import_oci_layout(&repo, layout_path, None, reporter).await;
         let err = result.expect_err("should fail with no matching platform");
         let err_msg = format!("{err:#}");
         assert!(
