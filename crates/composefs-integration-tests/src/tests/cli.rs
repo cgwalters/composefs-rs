@@ -15,6 +15,14 @@ use crate::{cfsctl, create_test_rootfs, integration_test};
 // create_oci_layout() (single layer with usr/ dir + hello.txt, mtime=1234567890).
 const OCI_LAYOUT_COMPOSEFS_ID: &str = "f26c6eb439749b82f0d1520e83455bb21766572fb2b5cfe009dd7749a61caf74e0c42c56f1a2cbd9d\
      359e7d172c8e2c65641666c9a18cc484a8b0f6e4e6d47ab";
+// Pinned V1 composefs image ID for the same OCI layout (V1 writer: compact inodes, BFS).
+const OCI_LAYOUT_COMPOSEFS_V1_ID: &str = "5973d67c99d847461d7b51cbe7b38b537e64f74cf4b42ddc63670d98e053202\
+     cc77ae195b7f10f619808d33aa25f11f428d42de7eaee08e2af5da4e1014ce68b";
+// Pinned V1 bootable composefs image ID for the bootable OCI layout built by
+// create_bootable_oci_layout() (usr/, boot/, sysroot/ + usr/hello.txt, mtime=1234567890).
+// This is the image ID after transform_for_boot (empty /boot + /sysroot, SELinux relabeling).
+const OCI_LAYOUT_BOOTABLE_COMPOSEFS_V1_ID: &str = "449a384bc52879aec87093ce4fc78c65f06ac4edf6bf92b8f2ca1e563ef9ee2\
+     fa8f151e11a100d520ac95df463faa9bc190bc48643981c4c29088e3f47700854";
 
 /// Create a fresh initialized insecure repository in a tempdir.
 ///
@@ -1696,3 +1704,397 @@ fn test_compute_image_id() -> Result<()> {
     Ok(())
 }
 integration_test!(test_compute_image_id);
+
+/// Creates an OCI image layout that satisfies the `transform_for_boot` requirements:
+/// the image must contain `/boot`, `/sysroot`, and `/usr` as top-level directories.
+fn create_bootable_oci_layout(parent: &std::path::Path) -> Result<std::path::PathBuf> {
+    use cap_std_ext::cap_std;
+    use ocidir::oci_spec::image::{
+        ConfigBuilder, ImageConfigurationBuilder, Platform, PlatformBuilder, RootFsBuilder,
+    };
+
+    let oci_dir = parent.join("oci-bootable");
+    std::fs::create_dir_all(&oci_dir)?;
+
+    let dir = cap_std::fs::Dir::open_ambient_dir(&oci_dir, cap_std::ambient_authority())?;
+    let ocidir = ocidir::OciDir::ensure(dir)?;
+
+    let mut manifest = ocidir.new_empty_manifest()?.build()?;
+
+    let runtime_config = ConfigBuilder::default().build()?;
+    let rootfs = RootFsBuilder::default()
+        .typ("layers")
+        .diff_ids(Vec::<String>::new())
+        .build()?;
+    let mut config = ImageConfigurationBuilder::default()
+        .architecture("amd64")
+        .os("linux")
+        .rootfs(rootfs)
+        .config(runtime_config)
+        .build()?;
+
+    let mut layer_builder = ocidir.create_layer(None)?;
+    // Add the directories required by transform_for_boot
+    for dir_name in &["usr/", "boot/", "sysroot/"] {
+        let mut dir_header = tar::Header::new_gnu();
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_size(0);
+        dir_header.set_mode(0o755);
+        dir_header.set_uid(0);
+        dir_header.set_gid(0);
+        dir_header.set_mtime(1234567890);
+        dir_header.set_cksum();
+        layer_builder.append_data(&mut dir_header, dir_name, &[] as &[u8])?;
+    }
+    // Add a file under usr/ so the image has non-trivial content
+    {
+        let data = b"hello from bootable test layer\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(1234567890);
+        header.set_cksum();
+        layer_builder.append_data(&mut header, "usr/hello.txt", &data[..])?;
+    }
+    let layer = layer_builder.into_inner()?.complete()?;
+
+    ocidir.push_layer(
+        &mut manifest,
+        &mut config,
+        layer,
+        "bootable test layer",
+        None,
+    );
+
+    let platform: Platform = PlatformBuilder::default()
+        .architecture("amd64")
+        .os("linux")
+        .build()?;
+    ocidir.insert_manifest_and_config(manifest, config, None, platform)?;
+
+    Ok(oci_dir)
+}
+
+/// Test that `oci composefs-digest-karg` emits a valid V1 karg string.
+///
+/// Pulls a small local OCI image using an insecure repo and verifies the subcommand outputs
+/// `composefs.digest=?<128-char-hex>` (the `?` marks fs-verity verification as optional).
+fn test_oci_composefs_digest_karg() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_bootable_oci_layout(fixture_dir.path())?;
+
+    let pull_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} karg-test-image"
+    )
+    .read()?;
+
+    // Extract the config digest from pull output (e.g. "config   sha256:abc...")
+    let config_digest = pull_output
+        .lines()
+        .find_map(|l| l.strip_prefix("config").map(|s| s.trim().to_string()))
+        .expect("config digest in pull output");
+    let at_config_digest = format!("@{config_digest}");
+
+    let karg = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci composefs-digest-karg {at_config_digest}"
+    )
+    .read()?;
+    let karg = karg.trim();
+
+    // Parse like ComposefsCmdline would: strip the key, then the optional '?' insecure marker,
+    // then validate the hex digest.
+    let after_key = karg
+        .strip_prefix("composefs.digest=")
+        .unwrap_or_else(|| panic!("expected karg to start with 'composefs.digest=', got: {karg}"));
+    // This test uses an insecure repo, so the '?' insecure marker must be present.
+    let hex = after_key
+        .strip_prefix('?')
+        .unwrap_or_else(|| panic!("expected insecure '?' prefix in karg, got: {karg}"));
+    // The default repo algorithm is fsverity-sha512-12 (SHA-512), which produces
+    // a 64-byte digest encoded as 128 hex characters.
+    assert_eq!(
+        hex.len(),
+        128,
+        "expected 128-char sha512 hex digest, got: {hex}"
+    );
+    assert!(
+        hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "expected hex digest, got: {hex}"
+    );
+
+    // Should be deterministic
+    let karg2 = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci composefs-digest-karg {at_config_digest}"
+    )
+    .read()?;
+    assert_eq!(
+        karg,
+        karg2.trim(),
+        "composefs-digest-karg should be deterministic"
+    );
+
+    // The karg digest is the V1 bootable composefs image ID with optional '?' insecure marker.
+    // Strip the key prefix and the insecure marker to get the raw digest for pinning.
+    let karg_digest = karg
+        .strip_prefix("composefs.digest=")
+        .and_then(|s| s.strip_prefix('?').or(Some(s)))
+        .unwrap_or(karg);
+    assert_eq!(
+        karg_digest, OCI_LAYOUT_BOOTABLE_COMPOSEFS_V1_ID,
+        "bootable V1 composefs image ID changed — \
+         update OCI_LAYOUT_BOOTABLE_COMPOSEFS_V1_ID with the new value: {karg_digest}"
+    );
+
+    Ok(())
+}
+integration_test!(test_oci_composefs_digest_karg);
+
+/// Test that --erofs-version 1 and 2 produce different deterministic digests,
+/// for both `compute-id` (no-repo) and `create-image` (repo-based).
+fn test_erofs_versions() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    // V1 digest via compute-id (no repo)
+    let id1 = cmd!(
+        sh,
+        "{cfsctl} --no-repo --erofs-version 1 compute-id --no-propagate-usr-to-root {rootfs}"
+    )
+    .read()?;
+
+    // V2 digest via compute-id (no repo)
+    let id2 = cmd!(
+        sh,
+        "{cfsctl} --no-repo --erofs-version 2 compute-id --no-propagate-usr-to-root {rootfs}"
+    )
+    .read()?;
+
+    // Default digest (should be V2)
+    let id_default = cmd!(
+        sh,
+        "{cfsctl} --no-repo compute-id --no-propagate-usr-to-root {rootfs}"
+    )
+    .read()?;
+
+    assert_ne!(
+        id1.trim(),
+        id2.trim(),
+        "V1 and V2 should produce different digests"
+    );
+    assert_eq!(id2.trim(), id_default.trim(), "Default should be V2");
+
+    // Also verify via create-image in a real repo
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+
+    let img_v1 = cmd!(
+        sh,
+        "{cfsctl} --insecure --erofs-version 1 --repo {repo} create-image {rootfs}"
+    )
+    .read()?;
+    let img_v2 = cmd!(
+        sh,
+        "{cfsctl} --insecure --erofs-version 2 --repo {repo} create-image {rootfs}"
+    )
+    .read()?;
+    let img_default = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs}"
+    )
+    .read()?;
+
+    assert_ne!(
+        img_v1.trim(),
+        img_v2.trim(),
+        "create-image: V1 and V2 should produce different image IDs"
+    );
+    assert_eq!(
+        img_v2.trim(),
+        img_default.trim(),
+        "create-image: default should match V2"
+    );
+
+    Ok(())
+}
+integration_test!(test_erofs_versions);
+
+/// Verify that `create-image --erofs-version 1` is idempotent and differs from V2.
+fn test_create_image_v1_idempotent() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    let v1_id_a = cmd!(
+        sh,
+        "{cfsctl} --insecure --erofs-version 1 --repo {repo} create-image {rootfs}"
+    )
+    .read()?;
+    let v1_id_b = cmd!(
+        sh,
+        "{cfsctl} --insecure --erofs-version 1 --repo {repo} create-image {rootfs}"
+    )
+    .read()?;
+    let v2_id = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs}"
+    )
+    .read()?;
+
+    assert_eq!(
+        v1_id_a.trim(),
+        v1_id_b.trim(),
+        "create-image V1 must be idempotent"
+    );
+    assert_ne!(
+        v1_id_a.trim(),
+        v2_id.trim(),
+        "create-image V1 and V2 must produce different image IDs"
+    );
+
+    Ok(())
+}
+integration_test!(test_create_image_v1_idempotent);
+
+/// Verify that a repository initialized with `--erofs-version 1` produces V1 images
+/// by default, without needing `--erofs-version` on every subsequent command.
+fn test_v1_repo_uses_v1_by_default() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    // Init a V1-only repo using the init subcommand's --erofs flag
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    cmd!(sh, "{cfsctl} --repo {repo} init --insecure --erofs v1").read()?;
+
+    // Verify meta.json records v1_erofs in ro_compat (V1-only mode)
+    let meta_json = std::fs::read_to_string(repo.join("meta.json"))?;
+    assert!(
+        meta_json.contains("v1_erofs"),
+        "meta.json should contain v1_erofs in ro_compat for a V1-only repo, got: {meta_json}"
+    );
+
+    // create-image WITHOUT --erofs-version flag — should use the repo's default (V1)
+    let id_default = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs}"
+    )
+    .read()?;
+    let id_default = id_default.trim();
+
+    // create-image WITH explicit --erofs-version 1 — should be identical
+    let id_explicit_v1 = cmd!(
+        sh,
+        "{cfsctl} --insecure --erofs-version 1 --repo {repo} create-image {rootfs}"
+    )
+    .read()?;
+    let id_explicit_v1 = id_explicit_v1.trim();
+
+    assert_eq!(
+        id_default, id_explicit_v1,
+        "repo initialized as V1 must produce V1 images by default (no flag needed)"
+    );
+
+    // create-image with explicit --erofs-version 2 — should differ
+    let id_v2 = cmd!(
+        sh,
+        "{cfsctl} --insecure --erofs-version 2 --repo {repo} create-image {rootfs}"
+    )
+    .read()?;
+    let id_v2 = id_v2.trim();
+
+    assert_ne!(
+        id_default, id_v2,
+        "V1 repo default must not equal explicit V2 output"
+    );
+
+    Ok(())
+}
+integration_test!(test_v1_repo_uses_v1_by_default);
+
+/// Verify `oci compute-id --erofs-version 1` is idempotent, differs from V2,
+/// and matches the pinned V1 digest for the deterministic test OCI layout.
+fn test_oci_pull_v1_digest_stability() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    // Pull the OCI layout
+    let pull_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-v1-image"
+    )
+    .read()?;
+
+    // Extract config digest from pull output (e.g. "config sha256:abc...")
+    let config_digest = pull_output
+        .lines()
+        .find_map(|l| l.strip_prefix("config").map(|s| s.trim().to_string()))
+        .expect("config digest in pull output");
+    let at_config_digest = format!("@{config_digest}");
+
+    // Compute V1 digest twice — must be identical (idempotency)
+    let v1_id_a = cmd!(
+        sh,
+        "{cfsctl} --insecure --erofs-version 1 --repo {repo} oci compute-id {at_config_digest}"
+    )
+    .read()?;
+    let v1_id_b = cmd!(
+        sh,
+        "{cfsctl} --insecure --erofs-version 1 --repo {repo} oci compute-id {at_config_digest}"
+    )
+    .read()?;
+    assert_eq!(
+        v1_id_a.trim(),
+        v1_id_b.trim(),
+        "V1 oci compute-id must be idempotent"
+    );
+
+    // V2 (default) must differ from V1
+    let v2_id = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci compute-id {at_config_digest}"
+    )
+    .read()?;
+    assert_ne!(
+        v1_id_a.trim(),
+        v2_id.trim(),
+        "V1 and V2 oci compute-id must produce different digests"
+    );
+
+    // V2 must still match the existing pinned constant
+    assert_eq!(
+        v2_id.trim(),
+        OCI_LAYOUT_COMPOSEFS_ID,
+        "V2 OCI layout composefs image ID changed"
+    );
+
+    // V1 must match the pinned V1 constant (stability across code changes)
+    assert_eq!(
+        v1_id_a.trim(),
+        OCI_LAYOUT_COMPOSEFS_V1_ID,
+        "V1 OCI layout composefs image ID changed — \
+         the V1 EROFS writer produced different output for the same deterministic OCI image"
+    );
+
+    Ok(())
+}
+integration_test!(test_oci_pull_v1_digest_stability);

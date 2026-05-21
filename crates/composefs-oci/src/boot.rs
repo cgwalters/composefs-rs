@@ -60,8 +60,10 @@ pub fn remove_boot_image<ObjectID: FsVerityHashValue>(
         repo,
         &config_json,
         img.layer_refs().clone(),
-        img.image_ref(),
-        None, // no boot image
+        img.image_ref_v2(), // preserve existing V2 image ref
+        img.image_ref_v1(), // preserve existing V1 image ref
+        None,               // no boot image (V2)
+        None,               // no boot image (V1)
     )?;
 
     let manifest_json = img.read_manifest_json(repo)?;
@@ -86,7 +88,6 @@ pub fn remove_boot_image<ObjectID: FsVerityHashValue>(
 #[cfg(all(test, feature = "boot"))]
 mod test {
     use super::*;
-    use composefs::erofs::format::FormatVersion;
     use composefs::fsverity::Sha256HashValue;
     use composefs::test::TestRepo;
     use composefs_boot::bootloader::get_boot_resources;
@@ -122,7 +123,7 @@ mod test {
         assert_eq!(oci.boot_image_ref(), Some(&image_verity));
 
         let plain_image = crate::image::create_filesystem(repo, &img.config_digest, None).unwrap();
-        let plain_verity = plain_image.compute_image_id(FormatVersion::V2);
+        let plain_verity = plain_image.compute_image_id(repo.erofs_version());
         assert_ne!(
             image_verity, plain_verity,
             "boot-transformed image should differ from non-transformed image"
