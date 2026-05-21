@@ -19,10 +19,18 @@ const OCI_LAYOUT_COMPOSEFS_ID: &str = "f26c6eb439749b82f0d1520e83455bb21766572fb
 /// Create a fresh initialized insecure repository in a tempdir.
 ///
 /// Returns the tempdir (for lifetime) and the path to the repo.
+///
+/// Creates a V2 (legacy) EROFS repo explicitly so that tests which compare
+/// against pinned V2 digests (e.g. `OCI_LAYOUT_COMPOSEFS_ID`) continue to
+/// work correctly now that `cfsctl init` defaults to V1.
 fn init_insecure_repo(sh: &Shell, cfsctl: &std::path::Path) -> Result<tempfile::TempDir> {
     let repo_dir = tempfile::tempdir()?;
     let repo = repo_dir.path();
-    cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
+    cmd!(
+        sh,
+        "{cfsctl} --repo {repo} init --insecure --erofs-version 2"
+    )
+    .read()?;
     Ok(repo_dir)
 }
 
