@@ -16,8 +16,8 @@ use fn_error_context::context;
 use sha2::{Digest, Sha256};
 
 use composefs::{
-    erofs::format::FormatVersion,
-    fsverity::FsVerityHashValue,
+    erofs::writer::mkfs_erofs_versioned,
+    fsverity::{FsVerityHashValue, compute_verity},
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Stat},
 };
@@ -126,7 +126,7 @@ pub fn compute_per_layer_digests<ObjectID: FsVerityHashValue>(
         while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
             process_entry(&mut single_fs, entry)?;
         }
-        layer_digests.push(single_fs.compute_image_id(FormatVersion::V1));
+        layer_digests.push(single_fs.compute_image_id(repo.erofs_version()));
     }
 
     Ok(layer_digests)
@@ -147,7 +147,7 @@ pub fn compute_merged_digest<ObjectID: FsVerityHashValue>(
     config_verity: Option<&ObjectID>,
 ) -> Result<ObjectID> {
     let fs = create_filesystem(repo, config_name, config_verity)?;
-    Ok(fs.compute_image_id(FormatVersion::V1))
+    Ok(fs.compute_image_id(repo.erofs_version()))
 }
 
 /// Compute per-layer EROFS images and their fs-verity digests.
@@ -181,7 +181,10 @@ pub fn generate_per_layer_images<ObjectID: FsVerityHashValue>(
         while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
             process_entry(&mut single_fs, entry)?;
         }
-        results.push(single_fs.generate_erofs_image());
+        let version = repo.erofs_version();
+        let erofs_bytes = mkfs_erofs_versioned(&single_fs, version);
+        let digest = compute_verity(&erofs_bytes);
+        results.push((erofs_bytes, digest));
     }
 
     Ok(results)
@@ -198,7 +201,10 @@ pub fn generate_merged_image<ObjectID: FsVerityHashValue>(
     config_verity: Option<&ObjectID>,
 ) -> Result<(Box<[u8]>, ObjectID)> {
     let fs = create_filesystem(repo, config_name, config_verity)?;
-    Ok(fs.generate_erofs_image())
+    let version = repo.erofs_version();
+    let erofs_bytes = mkfs_erofs_versioned(&fs, version);
+    let digest = compute_verity(&erofs_bytes);
+    Ok((erofs_bytes, digest))
 }
 
 /// Creates a filesystem from the given OCI container.  No special transformations are performed to
@@ -747,7 +753,7 @@ mod test {
         assert_eq!(per_layer.len(), 1);
 
         let merged_fs = create_filesystem(&repo, &config_digest, Some(&config_verity)).unwrap();
-        let merged_digest = merged_fs.compute_image_id(FormatVersion::V1);
+        let merged_digest = merged_fs.compute_image_id(repo.erofs_version());
 
         // The merged filesystem applies transform_for_oci() which copies /usr metadata
         // to the root, so the digests should differ.

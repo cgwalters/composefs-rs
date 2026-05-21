@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use xshell::{Shell, cmd};
 
-use crate::{cfsctl, create_oci_layout, integration_test};
+use crate::{cfsctl, create_oci_layout, init_insecure_repo, integration_test};
 
 /// Generate a self-signed X.509 certificate and private key for testing.
 fn generate_test_cert(dir: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -47,7 +47,7 @@ fn pull_oci_image(
 fn test_sign_unsigned_image() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -74,7 +74,7 @@ integration_test!(test_sign_unsigned_image);
 fn test_sign_and_verify() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -106,7 +106,7 @@ integration_test!(test_sign_and_verify);
 fn test_verify_unsigned_fails() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -131,7 +131,7 @@ integration_test!(test_verify_unsigned_fails);
 fn test_verify_wrong_cert_fails() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -169,7 +169,7 @@ integration_test!(test_verify_wrong_cert_fails);
 fn test_verify_without_cert() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -206,7 +206,7 @@ integration_test!(test_verify_without_cert);
 fn test_export_signatures() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -260,7 +260,7 @@ integration_test!(test_export_signatures);
 fn test_sign_idempotent() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -341,7 +341,7 @@ fn test_pull_require_signature_with_sig() -> Result<()> {
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
 
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
 
     // Pull the image first, sign it, so signatures are in the repo.
@@ -378,7 +378,7 @@ integration_test!(test_pull_require_signature_with_sig);
 fn sign_and_export() -> Result<(serde_json::Value, tempfile::TempDir, tempfile::TempDir)> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -581,7 +581,7 @@ integration_test!(test_sign_erofs_blobs_nonempty);
 fn test_seal_and_sign_roundtrip() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -682,7 +682,7 @@ integration_test!(test_seal_and_sign_roundtrip);
 fn test_inspect_shows_referrer_info() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -743,7 +743,7 @@ integration_test!(test_inspect_shows_referrer_info);
 fn test_mount_require_signature_needs_trust_cert() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -770,7 +770,7 @@ integration_test!(test_mount_require_signature_needs_trust_cert);
 fn test_mount_require_signature_fails_unsigned() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -800,7 +800,7 @@ integration_test!(test_mount_require_signature_fails_unsigned);
 fn test_mount_require_signature_fails_wrong_cert() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -841,7 +841,7 @@ integration_test!(test_mount_require_signature_fails_wrong_cert);
 fn test_mount_require_signature_passes_with_valid_sig() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -906,7 +906,7 @@ integration_test!(test_mount_require_signature_passes_with_valid_sig);
 fn test_multi_signer_sign_and_verify() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -994,7 +994,7 @@ fn test_pull_require_signature_wrong_cert() -> Result<()> {
     let (wrong_cert, _) = generate_test_cert(wrong_cert_dir.path())?;
 
     // Pull and sign in first repo
-    let repo1_dir = tempfile::tempdir()?;
+    let repo1_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo1 = repo1_dir.path();
     pull_oci_image(&sh, &cfsctl, repo1, &oci_layout, "test-image")?;
     cmd!(
@@ -1024,7 +1024,7 @@ integration_test!(test_pull_require_signature_wrong_cert);
 fn test_export_signatures_when_none_exist() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
