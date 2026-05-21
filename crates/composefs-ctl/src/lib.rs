@@ -22,6 +22,9 @@ pub use composefs_http;
 #[cfg(feature = "oci")]
 pub use composefs_oci;
 
+pub mod composefs_info;
+pub mod mkcomposefs;
+
 #[cfg(any(feature = "oci", feature = "http"))]
 use std::collections::HashMap;
 use std::io::Read;
@@ -59,7 +62,10 @@ use composefs::{
     erofs::reader::erofs_to_filesystem,
     fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     generic_tree::{FileSystem, Inode},
-    repository::{REPO_METADATA_FILENAME, Repository, read_repo_algorithm, system_path, user_path},
+    repository::{
+        REPO_METADATA_FILENAME, Repository, RepositoryConfig, read_repo_algorithm, system_path,
+        user_path,
+    },
     tree::RegularFile,
 };
 
@@ -187,6 +193,11 @@ pub struct App {
     #[clap(long, value_enum)]
     pub hash: Option<HashType>,
 
+    /// The EROFS format version to use when generating images.
+    /// If omitted, the library default (V2) is used.
+    #[clap(long, value_enum)]
+    pub erofs_version: Option<ErofsVersion>,
+
     /// Deprecated: security mode is now auto-detected from meta.json.
     /// Use `cfsctl init --insecure` to create a repo without verity.
     /// Kept for backward compatibility.
@@ -219,6 +230,26 @@ pub enum HashType {
     Sha256,
     /// Sha512
     Sha512,
+}
+
+/// The EROFS format version used when generating images.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ErofsVersion {
+    /// Format V1: compact inodes, BFS, C-compatible.
+    #[clap(name = "1")]
+    V1,
+    /// Format V2: extended inodes, DFS, current default.
+    #[clap(name = "2")]
+    V2,
+}
+
+impl From<ErofsVersion> for composefs::erofs::format::FormatVersion {
+    fn from(v: ErofsVersion) -> Self {
+        match v {
+            ErofsVersion::V1 => Self::V1,
+            ErofsVersion::V2 => Self::V2,
+        }
+    }
 }
 
 /// A reference to an OCI image: either a content digest or a named ref.
@@ -503,6 +534,11 @@ enum Command {
         /// re-imported after migration.
         #[clap(long)]
         reset_metadata: bool,
+        /// Default EROFS format version for images in this repository.
+        /// V1 is compatible with C `mkcomposefs` 1.0.8; V2 is the native format.
+        /// If omitted, falls back to the global `--erofs-version` flag, then defaults to V2.
+        #[clap(long)]
+        erofs_version: Option<ErofsVersion>,
     },
     /// Take a transaction lock on the repository.
     /// This prevents garbage collection from occurring.
@@ -588,6 +624,22 @@ enum Command {
     },
     #[cfg(feature = "http")]
     Fetch { url: String, name: String },
+
+    /// Run mkcomposefs (C-compatible image builder); hidden, also available via argv0 dispatch.
+    #[clap(hide = true, name = "mkcomposefs")]
+    Mkcomposefs {
+        /// Arguments forwarded verbatim to mkcomposefs
+        #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+
+    /// Run composefs-info (C-compatible image inspector); hidden, also available via argv0 dispatch.
+    #[clap(hide = true, name = "composefs-info")]
+    ComposefsInfo {
+        /// Arguments forwarded verbatim to composefs-info
+        #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
 }
 
 /// Acts as a proxy for the `cfsctl` CLI by executing the CLI logic programmatically
@@ -704,19 +756,34 @@ fn resolve_hash_type(
 
 /// Top-level dispatch: handle init specially, otherwise open repo and run.
 pub async fn run_app(args: App) -> Result<()> {
+    // Hidden compat subcommands: forward all trailing args to the respective tool.
+    if let Command::Mkcomposefs { args: extra } = args.cmd {
+        return mkcomposefs::run_from_args(extra);
+    }
+    if let Command::ComposefsInfo { args: extra } = args.cmd {
+        return composefs_info::run_from_args(extra);
+    }
+
     // Init is handled before opening a repo since it creates one
     if let Command::Init {
         ref algorithm,
         ref path,
         insecure,
         reset_metadata,
+        erofs_version: ref init_erofs_version,
     } = args.cmd
     {
+        // Prefer the subcommand-level --erofs-version; fall back to global flag; default V2.
+        let erofs_version = init_erofs_version
+            .or(args.erofs_version)
+            .map(composefs::erofs::format::FormatVersion::from)
+            .unwrap_or(composefs::erofs::format::FormatVersion::V2);
         return run_init(
             algorithm,
             path.as_deref(),
             insecure || args.insecure,
             reset_metadata,
+            erofs_version,
             &args,
         );
     }
@@ -764,6 +831,7 @@ fn run_init(
     path: Option<&Path>,
     insecure: bool,
     reset_metadata: bool,
+    erofs_version: composefs::erofs::format::FormatVersion,
     args: &App,
 ) -> Result<()> {
     let repo_path = if let Some(p) = path {
@@ -784,12 +852,18 @@ fn run_init(
 
     // init_path handles idempotency: same algorithm is a no-op,
     // different algorithm is an error.
+    let config = {
+        let mut c = RepositoryConfig::new(*algorithm);
+        c.erofs_version = erofs_version;
+        c.erofs_formats = composefs::erofs::format::FormatSet::from(erofs_version);
+        if insecure { c.set_insecure() } else { c }
+    };
     let created = match algorithm {
         Algorithm::Sha256 { .. } => {
-            Repository::<Sha256HashValue>::init_path(CWD, &repo_path, *algorithm, !insecure)?.1
+            Repository::<Sha256HashValue>::init_path(CWD, &repo_path, config)?.1
         }
         Algorithm::Sha512 { .. } => {
-            Repository::<Sha512HashValue>::init_path(CWD, &repo_path, *algorithm, !insecure)?.1
+            Repository::<Sha512HashValue>::init_path(CWD, &repo_path, config)?.1
         }
     };
 
@@ -831,6 +905,11 @@ where
     }
     if args.require_verity {
         repo.require_verity()?;
+    }
+    // If the user explicitly passed --erofs-version, override the stored
+    // repo setting for this invocation only (does not rewrite meta.json).
+    if let Some(version) = args.erofs_version {
+        repo.set_erofs_version(version.into());
     }
     Ok(repo)
 }
@@ -981,10 +1060,19 @@ fn dump_file_impl(
 
 /// Run commands that don't require a repository.
 pub async fn run_cmd_without_repo<ObjectID: FsVerityHashValue>(args: App) -> Result<()> {
+    let erofs_version = args
+        .erofs_version
+        .map(composefs::erofs::format::FormatVersion::from);
     match args.cmd {
         Command::ComputeId { fs_opts } => {
             let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None).await?;
-            let id = fs.compute_image_id();
+            let version = erofs_version.unwrap_or_default();
+            let id = composefs::fsverity::compute_verity::<ObjectID>(
+                &composefs::erofs::writer::mkfs_erofs_versioned(
+                    &mut composefs::erofs::writer::ValidatedFileSystem::new(fs)?,
+                    version,
+                ),
+            );
             println!("{}", id.to_hex());
         }
         Command::CreateDumpfile { fs_opts } => {
@@ -1071,8 +1159,8 @@ where
                 repo.mount_at(&erofs_id.to_hex(), mountpoint.as_str())?;
             }
             OciCommand::ComputeId { config_opts } => {
-                let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
-                let id = fs.compute_image_id();
+                let mut fs = load_filesystem_from_oci_image(&repo, config_opts)?;
+                let id = fs.compute_image_id(repo.erofs_version());
                 println!("{}", id.to_hex());
             }
             OciCommand::Pull {
@@ -1272,7 +1360,7 @@ where
             fs_opts,
             ref image_name,
         } => {
-            let fs = load_filesystem_from_ondisk_fs(&fs_opts, Some(Arc::clone(&repo))).await?;
+            let mut fs = load_filesystem_from_ondisk_fs(&fs_opts, Some(Arc::clone(&repo))).await?;
             let id = fs.commit_image(&repo, image_name.as_deref())?;
             println!("{}", id.to_id());
         }
@@ -1356,6 +1444,10 @@ where
             .await?;
             println!("content {digest}");
             println!("verity {}", verity.to_hex());
+        }
+        Command::Mkcomposefs { .. } | Command::ComposefsInfo { .. } => {
+            // Dispatched in run_app before a repository is opened
+            unreachable!("mkcomposefs/composefs-info are dispatched before opening a repository");
         }
     }
     Ok(())
