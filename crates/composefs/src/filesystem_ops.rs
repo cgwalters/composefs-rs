@@ -110,7 +110,7 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     /// Unlike `compute_image_id()` which discards the bytes, this preserves
     /// them for inclusion in composefs artifacts.
     pub fn generate_erofs_image(&self) -> (Box<[u8]>, ObjectID) {
-        let erofs_bytes = mkfs_erofs(self);
+        let erofs_bytes = crate::erofs::writer::mkfs_erofs(self);
         let digest = compute_verity(&erofs_bytes);
         (erofs_bytes, digest)
     }

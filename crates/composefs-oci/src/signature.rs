@@ -721,12 +721,13 @@ pub fn store_composefs_artifact<ObjectID: FsVerityHashValue>(
     let manifest_digest = sha256_digest(manifest_json.as_bytes());
 
     // Write the manifest (no tag — referrer artifacts aren't typically tagged)
+    let layer_verities_vec: Vec<(Box<str>, ObjectID)> = layer_verities.into_iter().collect();
     let (digest, verity) = crate::oci_image::write_manifest(
         repo,
         &artifact.manifest,
         &manifest_digest,
         &config_verity,
-        &layer_verities,
+        &layer_verities_vec,
         None,
     )?;
 
@@ -1636,18 +1637,16 @@ mod tests {
             .build()
             .unwrap();
 
-        let mut layer_verities = std::collections::HashMap::new();
-        layer_verities.insert(layer_digest.as_ref().into(), layer_verity);
-
         let manifest_json = manifest.to_string().unwrap();
         let manifest_digest = sha256_digest(manifest_json.as_bytes());
 
+        let layer_verities_vec = vec![(layer_digest.as_ref(), layer_verity)];
         let (digest, verity) = crate::oci_image::write_manifest(
             repo,
             &manifest,
             &manifest_digest,
             &config_verity,
-            &layer_verities,
+            &layer_verities_vec,
             Some("subject:v1"),
         )
         .unwrap();
@@ -1926,12 +1925,13 @@ mod tests {
 
         let manifest_json = manifest.to_string().unwrap();
         let manifest_digest = sha256_digest(manifest_json.as_bytes());
+        let empty_verities: Vec<(String, _)> = vec![];
         let (stored_digest, _) = crate::oci_image::write_manifest(
             repo,
             &manifest,
             &manifest_digest,
             &config_verity,
-            &std::collections::HashMap::new(),
+            &empty_verities,
             None,
         )
         .unwrap();
@@ -2020,7 +2020,7 @@ mod tests {
         refs.insert(Box::from(diff_id.as_str()), layer_verity.clone());
 
         let (config_digest, config_verity) =
-            crate::write_config(repo, &config, refs, None, None).unwrap();
+            crate::write_config(repo, &config, refs, None, None, None, None).unwrap();
 
         // --- 4. Compute merged digest directly (no sealing required) ---
         let expected_merged: Sha256HashValue =
@@ -2063,8 +2063,7 @@ mod tests {
             .unwrap();
 
         // Build layer verities map for writing the manifest
-        let mut layer_verities_map = std::collections::HashMap::new();
-        layer_verities_map.insert(diff_id.clone().into_boxed_str(), layer_verity.clone());
+        let layer_verities_vec = vec![(diff_id.clone().into_boxed_str(), layer_verity.clone())];
 
         let source_manifest_json = source_manifest.to_string().unwrap();
         let source_manifest_digest = sha256_digest(source_manifest_json.as_bytes());
@@ -2074,7 +2073,7 @@ mod tests {
             &source_manifest,
             &source_manifest_digest,
             &config_verity,
-            &layer_verities_map,
+            &layer_verities_vec,
             Some("e2e-test:v1"),
         )
         .unwrap();
@@ -2219,7 +2218,7 @@ mod tests {
         refs.insert(Box::from(diff_id.as_str()), layer_verity.clone());
 
         let (config_digest, config_verity) =
-            crate::write_config(repo, &config, refs, None, None).unwrap();
+            crate::write_config(repo, &config, refs, None, None, None, None).unwrap();
 
         // --- 4. Compute merged digest directly (no sealing required) ---
         let expected_merged: Sha256HashValue =
@@ -2297,8 +2296,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let mut layer_verities_map = std::collections::HashMap::new();
-        layer_verities_map.insert(diff_id.clone().into_boxed_str(), layer_verity.clone());
+        let layer_verities_vec = vec![(diff_id.clone().into_boxed_str(), layer_verity.clone())];
 
         let source_manifest_json = source_manifest.to_string().unwrap();
         let source_manifest_digest = sha256_digest(source_manifest_json.as_bytes());
@@ -2308,7 +2306,7 @@ mod tests {
             &source_manifest,
             &source_manifest_digest,
             &config_verity,
-            &layer_verities_map,
+            &layer_verities_vec,
             Some("e2e-pkcs7:v1"),
         )
         .unwrap();
