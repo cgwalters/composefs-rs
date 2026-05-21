@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use xshell::{Shell, cmd};
 
-use crate::{cfsctl, integration_test};
+use crate::{cfsctl, init_insecure_repo, integration_test};
 
 /// Generate a self-signed X.509 certificate and private key for testing.
 fn generate_test_cert(dir: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -57,7 +57,7 @@ fn podman_build_scratch_image(sh: &Shell, tag: &str) -> Result<String> {
 fn test_podman_build_pull_inspect() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
 
     let tag = "composefs-test-podman-inspect";
@@ -122,7 +122,7 @@ integration_test!(test_podman_build_pull_inspect);
 fn test_podman_build_seal_sign_verify() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
 
     // 1. Build
@@ -217,7 +217,7 @@ integration_test!(test_podman_build_seal_sign_verify);
 fn test_podman_build_sign_export_artifact_structure() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
 
     // Build and pull

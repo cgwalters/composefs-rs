@@ -9,35 +9,17 @@ use anyhow::Result;
 use rustix::path::Arg;
 use xshell::{Shell, cmd};
 
-use crate::{cfsctl, create_oci_layout, create_test_rootfs, integration_test};
+use crate::{cfsctl, create_oci_layout, create_test_rootfs, init_insecure_repo, integration_test};
 
 // Pinned composefs image ID for the deterministic OCI layout built by
 // create_oci_layout() (single layer with usr/ dir + hello.txt, mtime=1234567890).
-const OCI_LAYOUT_COMPOSEFS_ID: &str = "f26c6eb439749b82f0d1520e83455bb21766572fb2b5cfe009dd7749a61caf74e0c42c56f1a2cbd9d\
-     359e7d172c8e2c65641666c9a18cc484a8b0f6e4e6d47ab";
+const OCI_LAYOUT_COMPOSEFS_ID: &str = "33ce512df33a62c124409f846f97f35acc12e6a51c1af6040a3d2a209e2dcec6d388c34f2dc2dfc7e0a3e1f5eb6e0b4d5669d50f3d8b2349b4829446d8a5ac15";
 
 // Pinned V1 EROFS composefs image ID for the same OCI layout.  Differs from
 // OCI_LAYOUT_COMPOSEFS_ID because the V1 EROFS writer produces a different
 // on-disk layout than V2.
-const OCI_LAYOUT_COMPOSEFS_V1_ID: &str = "5973d67c99d847461d7b51cbe7b38b537e64f74cf4b42ddc63670d98e053202cc77ae195b7f10f619808d33aa25f11f428d42de7eaee08e2af5da4e1014ce68b";
+const OCI_LAYOUT_COMPOSEFS_V1_ID: &str = "af4db98ce98d73d1d164eeb081064b89ceae5bd181833cd4d22a6217d52668f338126b0289675a2066873ed7f3eb2f956f009d6a219fcdae1a6d339150834921";
 
-/// Create a fresh initialized insecure repository in a tempdir.
-///
-/// Returns the tempdir (for lifetime) and the path to the repo.
-///
-/// Creates a V2 (legacy) EROFS repo explicitly so that tests which compare
-/// against pinned V2 digests (e.g. `OCI_LAYOUT_COMPOSEFS_ID`) continue to
-/// work correctly now that `cfsctl init` defaults to V1.
-fn init_insecure_repo(sh: &Shell, cfsctl: &std::path::Path) -> Result<tempfile::TempDir> {
-    let repo_dir = tempfile::tempdir()?;
-    let repo = repo_dir.path();
-    cmd!(
-        sh,
-        "{cfsctl} --repo {repo} init --insecure --erofs-version 2"
-    )
-    .read()?;
-    Ok(repo_dir)
-}
 
 fn test_gc_empty_repo() -> Result<()> {
     let sh = Shell::new()?;
@@ -1121,7 +1103,7 @@ integration_test!(test_no_repo_rejects_create_image);
 fn test_fsck_json_healthy() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -1148,7 +1130,7 @@ integration_test!(test_fsck_json_healthy);
 fn test_fsck_json_corrupted_exits_zero() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let rootfs = create_test_rootfs(fixture_dir.path())?;
@@ -1199,7 +1181,7 @@ integration_test!(test_fsck_json_corrupted_exits_zero);
 fn test_oci_fsck_json() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -1222,7 +1204,7 @@ integration_test!(test_oci_fsck_json);
 fn test_oci_fsck_json_with_corruption() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -1692,21 +1674,22 @@ fn test_layer_tar_roundtrip() -> Result<()> {
         entries.push((path, content));
     }
 
-    // Verify we got the expected files (usr/ directory and hello.txt)
+    // Verify we got the expected files from create_oci_layout():
+    //   usr/, usr/bin/, etc/, usr/bin/hello.txt
     assert_eq!(
         entries.len(),
-        2,
-        "expected 2 entries in layer (usr/ and hello.txt)"
+        4,
+        "expected 4 entries in layer (usr/, usr/bin/, etc/, usr/bin/hello.txt)"
     );
 
-    // Find hello.txt and verify content
+    // Find usr/bin/hello.txt and verify content
     let hello_entry = entries
         .iter()
-        .find(|(path, _)| path == "hello.txt")
-        .expect("expected hello.txt in layer");
+        .find(|(path, _)| path == "usr/bin/hello.txt")
+        .expect("expected usr/bin/hello.txt in layer");
     assert_eq!(
         hello_entry.1, b"hello from test layer\n",
-        "hello.txt content mismatch"
+        "usr/bin/hello.txt content mismatch"
     );
 
     // Verify usr/ directory exists
@@ -2177,7 +2160,7 @@ integration_test!(test_oci_pull_v1_digest_stability);
 fn test_oci_push_to_layout() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -2278,7 +2261,7 @@ integration_test!(test_oci_push_to_layout);
 fn test_oci_push_pull_roundtrip() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
-    let repo_dir = tempfile::tempdir()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -2300,7 +2283,7 @@ fn test_oci_push_pull_roundtrip() -> Result<()> {
     .read()?;
 
     // Pull from the exported layout into a fresh repo
-    let repo2_dir = tempfile::tempdir()?;
+    let repo2_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo2 = repo2_dir.path();
     let pull_output = cmd!(
         sh,
