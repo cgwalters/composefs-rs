@@ -1512,9 +1512,16 @@ where
                 println!("objects  {}", result.stats);
 
                 if bootable {
+                    // ensure_oci_composefs_erofs (called inside pull) rewrites
+                    // the manifest, so result.manifest_digest is the *original*
+                    // pre-rewrite digest. Resolve the tag to get the current
+                    // manifest that already has image_ref_v1 populated, so
+                    // generate_boot_image can preserve it in the boot manifest.
+                    let (current_manifest_digest, _) =
+                        composefs_oci::oci_image::resolve_ref(&repo, tag_name)?;
                     let image_verity = composefs_oci::generate_boot_image(
                         &repo,
-                        &result.manifest_digest,
+                        &current_manifest_digest,
                         Some(tag_name),
                     )?;
                     println!("Boot image: {}", image_verity.to_hex());
