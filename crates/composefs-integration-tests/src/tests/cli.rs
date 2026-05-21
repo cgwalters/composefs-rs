@@ -16,13 +16,26 @@ use crate::{cfsctl, create_test_rootfs, integration_test};
 const OCI_LAYOUT_COMPOSEFS_ID: &str = "f26c6eb439749b82f0d1520e83455bb21766572fb2b5cfe009dd7749a61caf74e0c42c56f1a2cbd9d\
      359e7d172c8e2c65641666c9a18cc484a8b0f6e4e6d47ab";
 
+// Pinned V1 EROFS composefs image ID for the same OCI layout.  Differs from
+// OCI_LAYOUT_COMPOSEFS_ID because the V1 EROFS writer produces a different
+// on-disk layout than V2.
+const OCI_LAYOUT_COMPOSEFS_V1_ID: &str = "5973d67c99d847461d7b51cbe7b38b537e64f74cf4b42ddc63670d98e053202cc77ae195b7f10f619808d33aa25f11f428d42de7eaee08e2af5da4e1014ce68b";
+
 /// Create a fresh initialized insecure repository in a tempdir.
 ///
 /// Returns the tempdir (for lifetime) and the path to the repo.
+///
+/// Creates a V2 (legacy) EROFS repo explicitly so that tests which compare
+/// against pinned V2 digests (e.g. `OCI_LAYOUT_COMPOSEFS_ID`) continue to
+/// work correctly now that `cfsctl init` defaults to V1.
 fn init_insecure_repo(sh: &Shell, cfsctl: &std::path::Path) -> Result<tempfile::TempDir> {
     let repo_dir = tempfile::tempdir()?;
     let repo = repo_dir.path();
-    cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
+    cmd!(
+        sh,
+        "{cfsctl} --repo {repo} init --insecure --erofs-version 2"
+    )
+    .read()?;
     Ok(repo_dir)
 }
 

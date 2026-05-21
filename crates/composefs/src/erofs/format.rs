@@ -81,7 +81,7 @@ const INODE_DATALAYOUT_FLAT_INLINE: u16 = 4;
 const INODE_DATALAYOUT_CHUNK_BASED: u16 = 8;
 
 /// Data layout method for file content storage
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum DataLayout {
     /// File data stored in separate blocks
@@ -271,10 +271,102 @@ impl std::ops::BitOr<u32> for FileType {
 
 /// EROFS format version number
 pub const VERSION: U32 = U32::new(1);
-/// Composefs-specific version number
+/// Composefs-specific version number (V2, Rust-native format)
 pub const COMPOSEFS_VERSION: U32 = U32::new(2);
+/// Composefs-specific version number for V1 (C-compatible format: compact inodes, whiteout table)
+pub const COMPOSEFS_VERSION_V1: U32 = U32::new(0);
 /// Magic number identifying composefs images
 pub const COMPOSEFS_MAGIC: U32 = U32::new(0xd078629a);
+
+/// Format version for composefs images
+///
+/// This enum represents the different format versions supported by composefs.
+/// The format version affects the composefs header version field and build time handling.
+///
+/// Serialized as an integer: V1 → `1`, V2 → `2`.
+#[repr(u32)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Hash,
+    PartialEq,
+    Eq,
+    serde_repr::Serialize_repr,
+    serde_repr::Deserialize_repr,
+)]
+pub enum FormatVersion {
+    /// Format V1: compact inodes, whiteout table.
+    ///
+    /// This is the original format used by older versions of composefs.
+    /// Build time is set to the minimum mtime across all inodes.
+    /// The `composefs_version` header field is 0 normally, but 1 when
+    /// user-land whiteout files are present (matching C mkcomposefs behavior).
+    V1 = 1,
+    /// Format V2: extended inodes, no whiteout table, composefs_version=2
+    ///
+    /// This is the current default format.
+    #[default]
+    V2 = 2,
+}
+
+impl FormatVersion {
+    /// Returns the composefs_version value for this format version
+    pub fn composefs_version(self) -> U32 {
+        match self {
+            FormatVersion::V1 => COMPOSEFS_VERSION_V1,
+            FormatVersion::V2 => COMPOSEFS_VERSION,
+        }
+    }
+}
+
+/// The set of EROFS format versions to generate when committing images.
+///
+/// Stored in `meta.json` via the `"v1_erofs"` ro_compat feature flag:
+/// flag present → [`V1_ONLY`](Self::V1_ONLY), flag absent → [`BOTH`](Self::BOTH).
+///
+/// A `FormatSet` is a small bitset (bit 0 = V1, bit 1 = V2) so it can be
+/// cheaply copied and tested without heap allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatSet(u8);
+
+impl FormatSet {
+    /// Generate only V1 EROFS (default for new repos; C-tool compatible).
+    pub const V1_ONLY: FormatSet = FormatSet(0b01);
+    /// Generate both V1 and V2 EROFS (used by bootc and other multi-format consumers).
+    pub const BOTH: FormatSet = FormatSet(0b11);
+
+    /// Map a [`FormatVersion`] to its bit position in the `FormatSet` bitset.
+    ///
+    /// V1 → bit 0 (`0b01`), V2 → bit 1 (`0b10`).  Adding a V3 only requires
+    /// updating this one function.
+    fn version_bit(v: FormatVersion) -> u8 {
+        match v {
+            FormatVersion::V1 => 0b01,
+            FormatVersion::V2 => 0b10,
+        }
+    }
+
+    /// Returns `true` if this set includes the given format version.
+    pub fn contains(self, v: FormatVersion) -> bool {
+        self.0 & Self::version_bit(v) != 0
+    }
+
+    /// Iterate over the format versions in this set, in ascending order (V1 before V2).
+    pub fn iter(self) -> impl Iterator<Item = FormatVersion> {
+        [FormatVersion::V1, FormatVersion::V2]
+            .into_iter()
+            .filter(move |&v| self.contains(v))
+    }
+}
+
+impl From<FormatVersion> for FormatSet {
+    /// Create a single-version `FormatSet` from a [`FormatVersion`].
+    fn from(v: FormatVersion) -> Self {
+        FormatSet(FormatSet::version_bit(v))
+    }
+}
 
 /// Flag indicating the presence of ACL data
 pub const COMPOSEFS_FLAGS_HAS_ACL: U32 = U32::new(1 << 0);
@@ -493,7 +585,52 @@ pub struct XAttrHeader {
     pub value_size: U16,
 }
 
-/// Standard xattr name prefixes indexed by name_index
+/// EROFS xattr prefix index for `system.posix_acl_access` (index 2).
+pub const XATTR_INDEX_POSIX_ACL_ACCESS: u8 = 2;
+/// EROFS xattr prefix index for `system.posix_acl_default` (index 3).
+pub const XATTR_INDEX_POSIX_ACL_DEFAULT: u8 = 3;
+/// EROFS xattr prefix index for `lustre.` (index 5).
+/// Absent from C mkcomposefs v1.0.8's prefix table; V1 writer skips it.
+pub const XATTR_INDEX_LUSTRE: u8 = 5;
+
+// Overlay xattr keys used by composefs V1 whiteout escaping.
+// Named to match the C mkcomposefs OVERLAY_XATTR_* constants.
+/// `trusted.overlay.overlay.whiteout` — V1 escaped whiteout marker.
+pub const XATTR_OVERLAY_WHITEOUT: &[u8] = b"trusted.overlay.overlay.whiteout";
+/// `user.overlay.whiteout` — userxattr escaped whiteout marker.
+pub const XATTR_USERXATTR_WHITEOUT: &[u8] = b"user.overlay.whiteout";
+/// `trusted.overlay.overlay.whiteouts` — escaped whiteouts directory marker.
+pub const XATTR_OVERLAY_WHITEOUTS: &[u8] = b"trusted.overlay.overlay.whiteouts";
+/// `user.overlay.whiteouts` — userxattr whiteouts directory marker.
+pub const XATTR_USERXATTR_WHITEOUTS: &[u8] = b"user.overlay.whiteouts";
+/// `trusted.overlay.overlay.opaque` — escaped opaque directory marker.
+pub const XATTR_OVERLAY_OPAQUE: &[u8] = b"trusted.overlay.overlay.opaque";
+/// `user.overlay.opaque` — userxattr opaque directory marker.
+pub const XATTR_USERXATTR_OPAQUE: &[u8] = b"user.overlay.opaque";
+/// `trusted.overlay.opaque` — root opaque marker written by V1 writer.
+pub const XATTR_OVERLAY_OPAQUE_ROOT: &[u8] = b"trusted.overlay.opaque";
+/// `trusted.overlay.metacopy` — metacopy marker (C adds redirect xattr too).
+pub const XATTR_OVERLAY_METACOPY: &[u8] = b"trusted.overlay.metacopy";
+/// `trusted.overlay.redirect` — redirect target xattr.
+pub const XATTR_OVERLAY_REDIRECT: &[u8] = b"trusted.overlay.redirect";
+/// `trusted.overlay.` prefix — all xattrs with this prefix are escaped in V1.
+pub const XATTR_OVERLAY_PREFIX: &[u8] = b"trusted.overlay.";
+/// `trusted.overlay.overlay.` prefix — escaped overlay xattr prefix.
+pub const XATTR_OVERLAY_ESCAPED_PREFIX: &[u8] = b"trusted.overlay.overlay.";
+/// `security.selinux` — SELinux label, copied to overlay whiteout stubs.
+pub const XATTR_SECURITY_SELINUX: &[u8] = b"security.selinux";
+
+/// Standard xattr name prefixes indexed by EROFS name_index.
+///
+/// Index 0 is the fallback (empty prefix, full name stored as suffix).
+/// Indices 1–6 map to the well-known EROFS prefix constants:
+///   EROFS_XATTR_INDEX_USER=1, POSIX_ACL_ACCESS=2, POSIX_ACL_DEFAULT=3,
+///   EROFS_XATTR_INDEX_TRUSTED=4, EROFS_XATTR_INDEX_LUSTRE=5, EROFS_XATTR_INDEX_SECURITY=6.
+///
+/// **V1 compatibility note:** C mkcomposefs v1.0.8 does NOT include `lustre.` (index 5)
+/// in its prefix table. Any `lustre.*` xattr is therefore encoded with prefix index 0
+/// (raw fallback) by C. For V1 images the writer must skip index 5 during prefix
+/// matching so that `lustre.*` xattrs fall through to the empty-string fallback.
 pub const XATTR_PREFIXES: [&[u8]; 7] = [
     b"",
     b"user.",
@@ -518,4 +655,36 @@ pub struct DirectoryEntryHeader {
     pub file_type: FileTypeField,
     /// Reserved field
     pub reserved: u8,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_set_contains() {
+        assert!(FormatSet::BOTH.contains(FormatVersion::V1));
+        assert!(FormatSet::BOTH.contains(FormatVersion::V2));
+        assert!(FormatSet::V1_ONLY.contains(FormatVersion::V1));
+        assert!(!FormatSet::V1_ONLY.contains(FormatVersion::V2));
+    }
+
+    #[test]
+    fn test_format_set_from_version() {
+        assert_eq!(FormatSet::from(FormatVersion::V1), FormatSet::V1_ONLY);
+        // V2 alone is a single-version set (neither V1_ONLY nor BOTH).
+        let v2_only = FormatSet::from(FormatVersion::V2);
+        assert!(!v2_only.contains(FormatVersion::V1));
+        assert!(v2_only.contains(FormatVersion::V2));
+    }
+
+    #[test]
+    fn test_format_set_iter_order() {
+        // iter() must yield V1 before V2.
+        let versions: Vec<_> = FormatSet::BOTH.iter().collect();
+        assert_eq!(versions, vec![FormatVersion::V1, FormatVersion::V2]);
+
+        let v1_only: Vec<_> = FormatSet::V1_ONLY.iter().collect();
+        assert_eq!(v1_only, vec![FormatVersion::V1]);
+    }
 }

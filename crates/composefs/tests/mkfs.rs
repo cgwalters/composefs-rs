@@ -12,7 +12,11 @@ use tempfile::NamedTempFile;
 
 use composefs::{
     dumpfile::write_dumpfile,
-    erofs::{debug::debug_img, writer::mkfs_erofs},
+    erofs::{
+        debug::debug_img,
+        format::FormatVersion,
+        writer::{ValidatedFileSystem, mkfs_erofs, mkfs_erofs_versioned},
+    },
     fsverity::{FsVerityHashValue, Sha256HashValue},
     tree::{FileSystem, Inode, LeafContent, RegularFile, Stat},
 };
@@ -23,12 +27,13 @@ fn default_stat() -> Stat {
         st_uid: 0,
         st_gid: 0,
         st_mtim_sec: 0,
+        st_mtim_nsec: 0,
         xattrs: BTreeMap::new(),
     }
 }
 
 fn debug_fs(fs: FileSystem<impl FsVerityHashValue>) -> String {
-    let image = mkfs_erofs(&fs);
+    let image = mkfs_erofs(&ValidatedFileSystem::new(fs).unwrap());
     let mut output = vec![];
     debug_img(&mut output, &image).unwrap();
     String::from_utf8(output).unwrap()
@@ -54,6 +59,7 @@ fn add_leaf<ObjectID: FsVerityHashValue>(
             st_uid: 0,
             st_mode: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         },
         content,
@@ -94,22 +100,80 @@ fn test_simple() {
     insta::assert_snapshot!(debug_fs(fs));
 }
 
-fn foreach_case(f: fn(&FileSystem<Sha256HashValue>)) {
+fn foreach_case(f: fn(FileSystem<Sha256HashValue>)) {
     for case in [empty, simple] {
         let mut fs = FileSystem::new(default_stat());
         case(&mut fs);
-        f(&fs);
+        f(fs);
     }
 }
 
 #[test_with::executable(fsck.erofs)]
 fn test_fsck() {
     foreach_case(|fs| {
+        // V2 (default)
         let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(&mkfs_erofs(fs)).unwrap();
+        tmp.write_all(&mkfs_erofs(&ValidatedFileSystem::new(fs).unwrap()))
+            .unwrap();
         let mut fsck = Command::new("fsck.erofs").arg(tmp.path()).spawn().unwrap();
         assert!(fsck.wait().unwrap().success());
     });
+
+    // V1 — needs its own filesystem instances for add_overlay_whiteouts
+    for case in [empty, simple] {
+        let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+        case(&mut fs);
+        fs.add_overlay_whiteouts();
+        let image = mkfs_erofs_versioned(&ValidatedFileSystem::new(fs).unwrap(), FormatVersion::V1);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&image).unwrap();
+        let mut fsck = Command::new("fsck.erofs").arg(tmp.path()).spawn().unwrap();
+        assert!(fsck.wait().unwrap().success());
+    }
+}
+
+/// Verify byte-for-byte identity with C mkcomposefs for the pinned test cases.
+///
+/// These fixed cases (`empty`, `simple`) complement the proptest binary-compat
+/// tests in reader.rs which cover random trees. Keeping them pinned here means
+/// a regression on these canonical shapes is immediately visible without proptest
+/// shrinking, and is also validated by the digest stability tests above.
+#[test_with::executable(mkcomposefs)]
+fn test_vs_mkcomposefs() {
+    for case in [empty, simple] {
+        let mut fs_rust = FileSystem::new(default_stat());
+        case(&mut fs_rust);
+        let mut fs_c = FileSystem::new(default_stat());
+        case(&mut fs_c);
+
+        fs_rust.add_overlay_whiteouts();
+        let image = mkfs_erofs_versioned(
+            &ValidatedFileSystem::new(fs_rust).unwrap(),
+            FormatVersion::V1,
+        );
+
+        let mut mkcomposefs = Command::new("mkcomposefs")
+            .args(["--from-file", "-", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let mut stdin = mkcomposefs.stdin.take().unwrap();
+        write_dumpfile(&mut stdin, &fs_c).unwrap();
+        drop(stdin);
+
+        let output = mkcomposefs.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let mkcomposefs_image = output.stdout.into_boxed_slice();
+
+        if image != mkcomposefs_image {
+            let dump = dump_image(&image);
+            let mkcomposefs_dump = dump_image(&mkcomposefs_image);
+            assert_eq!(mkcomposefs_dump, dump, "structural diff (rust vs C)");
+        }
+        assert_eq!(image, mkcomposefs_image);
+    }
 }
 
 fn dump_image(img: &[u8]) -> String {
@@ -139,7 +203,7 @@ fn test_erofs_digest_stability() {
     for (name, case, expected_digest) in cases {
         let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
         case(&mut fs);
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs(&ValidatedFileSystem::new(fs).unwrap());
         let digest = composefs::fsverity::compute_verity::<Sha256HashValue>(&image);
         let hex = digest.to_hex();
         assert_eq!(
@@ -149,32 +213,33 @@ fn test_erofs_digest_stability() {
     }
 }
 
-#[should_panic]
-#[test_with::executable(mkcomposefs)]
-fn test_vs_mkcomposefs() {
-    foreach_case(|fs| {
-        let image = mkfs_erofs(fs);
+#[test]
+fn test_erofs_v1_digest_stability() {
+    // Same as test_erofs_digest_stability but for V1 (C-compatible) format.
+    // V1 output must be byte-stable since it needs to match C mkcomposefs.
+    let cases: &[(&str, fn(&mut FileSystem<Sha256HashValue>), &str)] = &[
+        (
+            "empty_v1",
+            empty,
+            "8f589e8f57ecb88823736b0d857ddca1e1068a23e264fad164b28f7038eb3682",
+        ),
+        (
+            "simple_v1",
+            simple,
+            "9f3f5620ee0c54708516467d0d58741e7963047c7106b245d94c298259d0fa01",
+        ),
+    ];
 
-        let mut mkcomposefs = Command::new("mkcomposefs")
-            .args(["--min-version=3", "--from-file", "-", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-
-        let mut stdin = mkcomposefs.stdin.take().unwrap();
-        write_dumpfile(&mut stdin, fs).unwrap();
-        drop(stdin);
-
-        let output = mkcomposefs.wait_with_output().unwrap();
-        assert!(output.status.success());
-        let mkcomposefs_image = output.stdout.into_boxed_slice();
-
-        if image != mkcomposefs_image {
-            let dump = dump_image(&image);
-            let mkcomposefs_dump = dump_image(&mkcomposefs_image);
-            assert_eq!(mkcomposefs_dump, dump);
-        }
-        assert_eq!(image, mkcomposefs_image); // fallback if the dump is somehow the same
-    });
+    for (name, case, expected_digest) in cases {
+        let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+        case(&mut fs);
+        fs.add_overlay_whiteouts();
+        let image = mkfs_erofs_versioned(&ValidatedFileSystem::new(fs).unwrap(), FormatVersion::V1);
+        let digest = composefs::fsverity::compute_verity::<Sha256HashValue>(&image);
+        let hex = digest.to_hex();
+        assert_eq!(
+            &hex, expected_digest,
+            "{name}: V1 EROFS digest changed — if this is intentional, update the pinned value"
+        );
+    }
 }

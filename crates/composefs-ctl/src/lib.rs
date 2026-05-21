@@ -56,10 +56,13 @@ use composefs_boot::write_boot;
 use composefs::shared_internals::IO_BUF_CAPACITY;
 use composefs::{
     dumpfile::{dump_single_dir, dump_single_file},
-    erofs::reader::erofs_to_filesystem,
+    erofs::{format::FormatSet, reader::erofs_to_filesystem},
     fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     generic_tree::{FileSystem, Inode},
-    repository::{REPO_METADATA_FILENAME, Repository, read_repo_algorithm, system_path, user_path},
+    repository::{
+        REPO_METADATA_FILENAME, Repository, RepositoryConfig, read_repo_algorithm, system_path,
+        user_path,
+    },
     tree::RegularFile,
 };
 
@@ -187,6 +190,11 @@ pub struct App {
     #[clap(long, value_enum)]
     pub hash: Option<HashType>,
 
+    /// The EROFS format version to use when generating images.
+    /// If omitted, the library default (V2) is used.
+    #[clap(long, value_enum)]
+    pub erofs_version: Option<ErofsVersion>,
+
     /// Deprecated: security mode is now auto-detected from meta.json.
     /// Use `cfsctl init --insecure` to create a repo without verity.
     /// Kept for backward compatibility.
@@ -219,6 +227,44 @@ pub enum HashType {
     Sha256,
     /// Sha512
     Sha512,
+}
+
+/// The EROFS format version used when generating images.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ErofsVersion {
+    /// Format V1: compact inodes, BFS, C-compatible.
+    #[clap(name = "1")]
+    V1,
+    /// Format V2: extended inodes, DFS, current default.
+    #[clap(name = "2")]
+    V2,
+}
+
+impl From<ErofsVersion> for composefs::erofs::format::FormatVersion {
+    fn from(v: ErofsVersion) -> Self {
+        match v {
+            ErofsVersion::V1 => Self::V1,
+            ErofsVersion::V2 => Self::V2,
+        }
+    }
+}
+
+/// EROFS format generation mode for `cfsctl init --erofs`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ErofsMode {
+    /// Generate only V1 EROFS (default; compatible with C `mkcomposefs`/`composefs-info` 1.0.8).
+    V1,
+    /// Generate both V1 and V2 EROFS (dual mode, used by bootc and other multi-format consumers).
+    Dual,
+}
+
+impl From<ErofsMode> for FormatSet {
+    fn from(m: ErofsMode) -> Self {
+        match m {
+            ErofsMode::V1 => FormatSet::V1_ONLY,
+            ErofsMode::Dual => FormatSet::BOTH,
+        }
+    }
 }
 
 /// A reference to an OCI image: either a content digest or a named ref.
@@ -503,6 +549,20 @@ enum Command {
         /// re-imported after migration.
         #[clap(long)]
         reset_metadata: bool,
+        /// Default EROFS format version for images in this repository.
+        /// V1 is compatible with C `mkcomposefs` 1.0.8.
+        /// If omitted, falls back to the global `--erofs-version` flag, then defaults to V2.
+        #[clap(long)]
+        erofs_version: Option<ErofsVersion>,
+        /// EROFS format generation mode.
+        ///
+        /// Controls which EROFS format versions are produced when committing images:
+        ///   v1    Generate only V1 EROFS (default; C-tool compatible)
+        ///   dual  Generate both V1 and V2 EROFS (used by bootc)
+        ///
+        /// If omitted, defaults to `v1`.
+        #[clap(long, value_enum)]
+        erofs: Option<ErofsMode>,
     },
     /// Take a transaction lock on the repository.
     /// This prevents garbage collection from occurring.
@@ -710,13 +770,29 @@ pub async fn run_app(args: App) -> Result<()> {
         ref path,
         insecure,
         reset_metadata,
+        erofs_version: ref init_erofs_version,
+        erofs: init_erofs,
     } = args.cmd
     {
+        // --erofs controls the FormatSet (which versions to generate); default V1_ONLY.
+        let erofs_formats = init_erofs
+            .map(FormatSet::from)
+            .unwrap_or(FormatSet::V1_ONLY);
+        // Prefer the subcommand-level --erofs-version; fall back to global flag.
+        // If neither is given, default to V1: that is the primary format for
+        // both v1-only and dual modes, and "cfsctl init" (no --erofs flag) is
+        // equivalent to "cfsctl init --erofs v1".
+        let erofs_version = init_erofs_version
+            .or(args.erofs_version)
+            .map(composefs::erofs::format::FormatVersion::from)
+            .unwrap_or(composefs::erofs::format::FormatVersion::V1);
         return run_init(
             algorithm,
             path.as_deref(),
             insecure || args.insecure,
             reset_metadata,
+            erofs_version,
+            erofs_formats,
             &args,
         );
     }
@@ -764,6 +840,8 @@ fn run_init(
     path: Option<&Path>,
     insecure: bool,
     reset_metadata: bool,
+    erofs_version: composefs::erofs::format::FormatVersion,
+    erofs_formats: FormatSet,
     args: &App,
 ) -> Result<()> {
     let repo_path = if let Some(p) = path {
@@ -784,12 +862,18 @@ fn run_init(
 
     // init_path handles idempotency: same algorithm is a no-op,
     // different algorithm is an error.
+    let config = {
+        let mut c = RepositoryConfig::new(*algorithm);
+        c.erofs_version = erofs_version;
+        c.erofs_formats = erofs_formats;
+        if insecure { c.set_insecure() } else { c }
+    };
     let created = match algorithm {
         Algorithm::Sha256 { .. } => {
-            Repository::<Sha256HashValue>::init_path(CWD, &repo_path, *algorithm, !insecure)?.1
+            Repository::<Sha256HashValue>::init_path(CWD, &repo_path, config)?.1
         }
         Algorithm::Sha512 { .. } => {
-            Repository::<Sha512HashValue>::init_path(CWD, &repo_path, *algorithm, !insecure)?.1
+            Repository::<Sha512HashValue>::init_path(CWD, &repo_path, config)?.1
         }
     };
 
@@ -831,6 +915,11 @@ where
     }
     if args.require_verity {
         repo.require_verity()?;
+    }
+    // If the user explicitly passed --erofs-version, override the stored
+    // repo setting for this invocation only (does not rewrite meta.json).
+    if let Some(version) = args.erofs_version {
+        repo.set_erofs_version(version.into());
     }
     Ok(repo)
 }
@@ -981,10 +1070,19 @@ fn dump_file_impl(
 
 /// Run commands that don't require a repository.
 pub async fn run_cmd_without_repo<ObjectID: FsVerityHashValue>(args: App) -> Result<()> {
+    let erofs_version = args
+        .erofs_version
+        .map(composefs::erofs::format::FormatVersion::from);
     match args.cmd {
         Command::ComputeId { fs_opts } => {
             let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None).await?;
-            let id = fs.compute_image_id();
+            let version = erofs_version.unwrap_or_default();
+            let id = composefs::fsverity::compute_verity::<ObjectID>(
+                &composefs::erofs::writer::mkfs_erofs_versioned(
+                    &composefs::erofs::writer::ValidatedFileSystem::new(fs)?,
+                    version,
+                ),
+            );
             println!("{}", id.to_hex());
         }
         Command::CreateDumpfile { fs_opts } => {
