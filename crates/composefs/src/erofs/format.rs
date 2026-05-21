@@ -332,8 +332,10 @@ impl FormatVersion {
 pub struct FormatSet(u8);
 
 impl FormatSet {
-    /// Generate only V1 EROFS (default for new repos; C-tool compatible).
+    /// Generate only V1 EROFS (C-tool compatible).
     pub const V1_ONLY: FormatSet = FormatSet(0b01);
+    /// Generate only V2 EROFS (composefs-rs native; repositories without a format flag).
+    pub const V2_ONLY: FormatSet = FormatSet(0b10);
     /// Generate both V1 and V2 EROFS (used by bootc and other multi-format consumers).
     pub const BOTH: FormatSet = FormatSet(0b11);
 

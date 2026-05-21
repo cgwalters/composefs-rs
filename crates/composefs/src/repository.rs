@@ -194,20 +194,28 @@ pub const REPO_FORMAT_VERSION: u32 = 1;
 /// - Unknown **incompatible** features cause the repository to be
 ///   rejected entirely.
 pub mod known_features {
-    /// The ro-compat feature flag for V1 EROFS repositories.
+    /// The ro-compat feature flag for V1-only EROFS repositories.
     ///
-    /// When present in `read_only_compatible`, the repository uses the V1
-    /// (C-tool compatible) EROFS format.  Old tools that don't recognize this
+    /// When present in `read_only_compatible`, the repository generates only V1
+    /// (C-tool compatible) EROFS images.  Old tools that don't recognize this
     /// flag will open the repository as read-only, preventing accidental V2
     /// image writes into a V1 repo.
     pub const V1_EROFS: &str = "v1_erofs";
+
+    /// The incompatible feature flag for dual-format (V1+V2) EROFS repositories.
+    ///
+    /// When present in `incompatible`, the repository generates both V1 and V2
+    /// EROFS images on every commit.  Old tools that don't understand this flag
+    /// must refuse to open the repository entirely — they would silently write
+    /// only V1 images, violating the dual-format invariant.
+    pub const BOTH_EROFS: &str = "both_erofs";
 
     /// Compatible features understood by this version.
     pub const COMPAT: &[&str] = &[];
     /// Read-only compatible features understood by this version.
     pub const RO_COMPAT: &[&str] = &[V1_EROFS];
     /// Incompatible features understood by this version.
-    pub const INCOMPAT: &[&str] = &[];
+    pub const INCOMPAT: &[&str] = &[BOTH_EROFS];
 }
 
 /// Feature flags for a composefs repository.
@@ -310,15 +318,21 @@ pub struct RepoMetadata {
 impl RepoMetadata {
     /// Derive the default EROFS format version from the feature flags.
     ///
-    /// - `"v1_erofs"` present in `read_only_compatible` → [`FormatVersion::V1`]
-    /// - absent → [`FormatVersion::V2`]
+    /// - `"v1_erofs"` in `read_only_compatible` → [`FormatVersion::V1`]
+    /// - `"both_erofs"` in `incompatible` → [`FormatVersion::V1`] (V1 is the primary format)
+    /// - neither → [`FormatVersion::V2`] (legacy default)
     pub fn erofs_version(&self) -> FormatVersion {
-        if self
+        let has_v1 = self
             .features
             .read_only_compatible
             .iter()
-            .any(|f| f == known_features::V1_EROFS)
-        {
+            .any(|f| f == known_features::V1_EROFS);
+        let has_both = self
+            .features
+            .incompatible
+            .iter()
+            .any(|f| f == known_features::BOTH_EROFS);
+        if has_v1 || has_both {
             FormatVersion::V1
         } else {
             FormatVersion::V2
@@ -344,20 +358,28 @@ impl RepoMetadata {
     /// Build metadata with the correct feature flags for the given EROFS format version
     /// and format set.
     ///
-    /// The EROFS format version is encoded in the feature flags with a single flag:
-    /// - V1 repositories (both V1_ONLY and BOTH) add `"v1_erofs"` to `ro_compat` so that
-    ///   older tools open them read-only rather than writing images in the wrong format.
-    /// - V2-only repositories omit `"v1_erofs"`.
+    /// The on-disk encoding uses two feature flags:
+    /// - `"v1_erofs"` (ro-compat) — present when the primary format is V1.  Old tools
+    ///   open the repository read-only rather than writing V2 images accidentally.
+    /// - `"both_erofs"` (incompat) — present when both V1 and V2 EROFS are generated.
+    ///   Old tools must refuse the repository entirely since they would silently omit V2.
+    ///
+    /// V2-only repositories (the legacy default) carry neither flag.
     pub fn new_with_formats(
         algorithm: Algorithm,
         erofs_version: FormatVersion,
-        _erofs_formats: FormatSet,
+        erofs_formats: FormatSet,
     ) -> Self {
         let mut features = FeatureFlags::default();
-        if erofs_version == FormatVersion::V1 {
+        if erofs_version == FormatVersion::V1 || erofs_formats == FormatSet::V1_ONLY {
             features
                 .read_only_compatible
                 .push(known_features::V1_EROFS.to_string());
+        }
+        if erofs_formats == FormatSet::BOTH {
+            features
+                .incompatible
+                .push(known_features::BOTH_EROFS.to_string());
         }
         Self {
             version: REPO_FORMAT_VERSION,
@@ -471,7 +493,7 @@ impl Default for RepositoryConfig {
         Self {
             algorithm: Algorithm::SHA256,
             erofs_version: FormatVersion::default(),
-            erofs_formats: FormatSet::from(FormatVersion::default()),
+            erofs_formats: FormatSet::V2_ONLY,
             insecure: false,
         }
     }
@@ -568,19 +590,27 @@ pub fn system_path() -> PathBuf {
 
 /// Derive the [`FormatSet`] from a [`RepoMetadata`].
 ///
-/// - `"v1_erofs"` present in `ro_compat` → [`FormatSet::V1_ONLY`]
-/// - `"v1_erofs"` absent → V2-only (reported as [`FormatSet::BOTH`] for
-///   forward-compatibility; dual V1+V2 mode will add its own flag later)
+/// - `"both_erofs"` in `incompatible` → [`FormatSet::BOTH`]
+/// - `"v1_erofs"` in `ro_compat` → [`FormatSet::V1_ONLY`]
+/// - neither → [`FormatSet::V2_ONLY`] (legacy default; no flag = V2-only)
 fn repo_formats_from_meta(meta: &RepoMetadata) -> FormatSet {
-    if meta
+    let has_both = meta
+        .features
+        .incompatible
+        .iter()
+        .any(|f| f == known_features::BOTH_EROFS);
+    if has_both {
+        return FormatSet::BOTH;
+    }
+    let has_v1 = meta
         .features
         .read_only_compatible
         .iter()
-        .any(|f| f == known_features::V1_EROFS)
-    {
+        .any(|f| f == known_features::V1_EROFS);
+    if has_v1 {
         FormatSet::V1_ONLY
     } else {
-        FormatSet::BOTH
+        FormatSet::V2_ONLY
     }
 }
 
@@ -5233,8 +5263,11 @@ mod tests {
 
     #[test]
     fn test_init_v2_repo_metadata() {
-        let meta =
-            RepoMetadata::new_with_formats(Algorithm::SHA256, FormatVersion::V2, FormatSet::BOTH);
+        let meta = RepoMetadata::new_with_formats(
+            Algorithm::SHA256,
+            FormatVersion::V2,
+            FormatSet::V2_ONLY,
+        );
         assert_eq!(meta.erofs_version(), FormatVersion::V2);
         assert!(
             !meta
@@ -5608,9 +5641,12 @@ mod tests {
 
     #[test]
     fn test_v1_erofs_flag_absent_for_v2_repos() {
-        // V2 format → v1_erofs absent
-        let meta =
-            RepoMetadata::new_with_formats(Algorithm::SHA256, FormatVersion::V2, FormatSet::BOTH);
+        // V2-only format → v1_erofs absent, both_erofs absent
+        let meta = RepoMetadata::new_with_formats(
+            Algorithm::SHA256,
+            FormatVersion::V2,
+            FormatSet::V2_ONLY,
+        );
         assert!(
             !meta
                 .features
@@ -5618,6 +5654,14 @@ mod tests {
                 .contains(&known_features::V1_EROFS.to_string()),
             "V2 repo must NOT set v1_erofs in ro_compat, got: {:?}",
             meta.features.read_only_compatible
+        );
+        assert!(
+            !meta
+                .features
+                .incompatible
+                .contains(&known_features::BOTH_EROFS.to_string()),
+            "V2 repo must NOT set both_erofs in incompat, got: {:?}",
+            meta.features.incompatible
         );
         assert_eq!(meta.erofs_version(), FormatVersion::V2);
     }
@@ -5632,10 +5676,13 @@ mod tests {
         );
         assert_eq!(repo_formats_from_meta(&meta_v1), FormatSet::V1_ONLY);
 
-        // v1_erofs absent → BOTH (V2-only default)
-        let meta_v2 =
-            RepoMetadata::new_with_formats(Algorithm::SHA256, FormatVersion::V2, FormatSet::BOTH);
-        assert_eq!(repo_formats_from_meta(&meta_v2), FormatSet::BOTH);
+        // v1_erofs absent → V2_ONLY (legacy default: no flag = V2-only repo)
+        let meta_v2 = RepoMetadata::new_with_formats(
+            Algorithm::SHA256,
+            FormatVersion::V2,
+            FormatSet::V2_ONLY,
+        );
+        assert_eq!(repo_formats_from_meta(&meta_v2), FormatSet::V2_ONLY);
     }
 
     #[test]
@@ -5671,19 +5718,28 @@ mod tests {
         let config = RepositoryConfig {
             algorithm: Algorithm::SHA256,
             erofs_version: FormatVersion::V2,
-            erofs_formats: FormatSet::BOTH,
+            erofs_formats: FormatSet::V2_ONLY,
             ..RepositoryConfig::default().set_insecure()
         };
         let (repo, was_new) = Repository::<Sha256HashValue>::init_path(CWD, &path, config)?;
         assert!(was_new);
         assert_eq!(repo.erofs_version(), FormatVersion::V2);
+        assert_eq!(repo.default_format_set(), FormatSet::V2_ONLY);
         assert!(
             !repo
                 .metadata()
                 .features
                 .read_only_compatible
                 .contains(&known_features::V1_EROFS.to_string()),
-            "v1_erofs must NOT be in ro_compat for V2 repos"
+            "v1_erofs must NOT be in ro_compat for V2-only repos"
+        );
+        assert!(
+            !repo
+                .metadata()
+                .features
+                .incompatible
+                .contains(&known_features::BOTH_EROFS.to_string()),
+            "both_erofs must NOT be in incompat for V2-only repos"
         );
         Ok(())
     }
@@ -5700,7 +5756,7 @@ mod tests {
         let repo_path = tmp.path().join("repo");
         let config = RepositoryConfig {
             algorithm: Algorithm::SHA256,
-            erofs_version: FormatVersion::V2,
+            erofs_version: FormatVersion::V1,
             erofs_formats: FormatSet::BOTH,
             ..RepositoryConfig::default().set_insecure()
         };

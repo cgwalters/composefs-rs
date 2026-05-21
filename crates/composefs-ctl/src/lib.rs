@@ -39,9 +39,11 @@ use rustix::fs::{CWD, Mode, OFlags};
 use serde::Serialize;
 
 use composefs_boot::BootOps;
+use composefs_boot::cmdline::ComposefsCmdline;
 #[cfg(feature = "oci")]
 use composefs_boot::write_boot;
 
+use composefs::erofs::format::FormatVersion;
 #[cfg(feature = "oci")]
 use composefs::shared_internals::IO_BUF_CAPACITY;
 use composefs::{
@@ -382,6 +384,28 @@ enum OciCommand {
         config_opts: OCIConfigFilesystemOptions,
     },
 
+    /// Compute the composefs boot image karg for a stored OCI image.
+    ///
+    /// Applies the bootable transformation (SELinux relabeling, empty /boot and /sysroot),
+    /// computes the V1 EROFS digest, and prints the full kernel argument string:
+    ///
+    ///   composefs.digest=<hex>
+    ///
+    /// This is intended for use in UKI Containerfile builds where no composefs
+    /// repository is available.  The output can be written directly to
+    /// /etc/kernel/cmdline:
+    ///
+    ///   cfsctl oci composefs-digest-karg @sha256:abc... > /etc/kernel/cmdline
+    ///
+    /// The image can be specified by ref name or @digest:
+    ///   cfsctl oci composefs-digest-karg myimage:latest
+    ///   cfsctl oci composefs-digest-karg @sha256:a1b2c3...
+    #[clap(name = "composefs-digest-karg")]
+    ComposefsDigestKarg {
+        #[clap(flatten)]
+        config_opts: OCIConfigOptions,
+    },
+
     /// Create the composefs image of the rootfs of a stored OCI image, perform bootable transformation, commit it to the repo,
     /// then configure boot for the image by writing new boot resources and bootloader entries to boot partition. Performs
     /// state preparation for composefs-setup-root consumption as well. Note that state preparation here is not suitable for
@@ -510,6 +534,24 @@ enum Command {
     /// Note that this does not create or commit the composefs image itself, and does not
     /// store any file objects in the repository.
     ComputeId {
+        #[clap(flatten)]
+        fs_opts: FsReadOptions,
+    },
+    /// Read rootfs located at a path and compute the composefs kernel argument string.
+    ///
+    /// Like compute-id but outputs the full kernel argument rather than the bare digest,
+    /// choosing the argument name based on the EROFS format version:
+    ///
+    ///   V1 (default): composefs.digest=<hex>
+    ///   V2:           composefs=<hex>
+    ///
+    /// Use --erofs-version to select the format; defaults to V1.
+    /// Use --bootable to apply the boot transformation (SELinux relabeling, empty /boot and /sysroot).
+    ///
+    /// Example (in a Containerfile):
+    ///   cfsctl --erofs-version 1 compute-karg --bootable /mnt/base > /etc/kernel/cmdline
+    #[clap(name = "compute-karg")]
+    ComputeKarg {
         #[clap(flatten)]
         fs_opts: FsReadOptions,
     },
@@ -702,7 +744,9 @@ pub async fn run_app(args: App) -> Result<()> {
     if args.no_repo
         || matches!(
             args.cmd,
-            Command::ComputeId { .. } | Command::CreateDumpfile { .. }
+            Command::ComputeId { .. }
+                | Command::ComputeKarg { .. }
+                | Command::CreateDumpfile { .. }
         )
     {
         // If a repo path is available and --no-repo wasn't passed,
@@ -985,6 +1029,21 @@ pub async fn run_cmd_without_repo<ObjectID: FsVerityHashValue>(args: App) -> Res
             );
             println!("{}", id.to_hex());
         }
+        Command::ComputeKarg { fs_opts } => {
+            let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None).await?;
+            let version = erofs_version.unwrap_or(FormatVersion::V1);
+            let id = composefs::fsverity::compute_verity::<ObjectID>(
+                &composefs::erofs::writer::mkfs_erofs_versioned(
+                    &composefs::erofs::writer::ValidatedFileSystem::new(fs)?,
+                    version,
+                ),
+            );
+            let karg = match version {
+                FormatVersion::V1 => ComposefsCmdline::new_v1(id, args.insecure),
+                FormatVersion::V2 => ComposefsCmdline::new_v2(id, args.insecure),
+            };
+            println!("{}", karg.to_cmdline_arg());
+        }
         Command::CreateDumpfile { fs_opts } => {
             let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None).await?;
             fs.print_dumpfile()?;
@@ -1072,6 +1131,25 @@ where
                 let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
                 let id = fs.compute_image_id(repo.erofs_version());
                 println!("{}", id.to_hex());
+            }
+            OciCommand::ComposefsDigestKarg { config_opts } => {
+                let verity = verity_opt(&config_opts.config_verity)?;
+                let (config_digest, config_verity) =
+                    resolve_oci_config(&repo, &config_opts.config_name, verity)?;
+                let mut fs = composefs_oci::image::create_filesystem(
+                    &repo,
+                    &config_digest,
+                    config_verity.as_ref(),
+                )?;
+                fs.transform_for_boot(&repo)?;
+                let digest = composefs::fsverity::compute_verity::<ObjectID>(
+                    &composefs::erofs::writer::mkfs_erofs_versioned(
+                        &composefs::erofs::writer::ValidatedFileSystem::new(fs)?,
+                        composefs::erofs::format::FormatVersion::V1,
+                    ),
+                );
+                let karg = ComposefsCmdline::new_v1(digest, repo.is_insecure());
+                println!("{}", karg.to_cmdline_arg());
             }
             OciCommand::Pull {
                 ref image,
@@ -1213,7 +1291,25 @@ where
                     config_verity.as_ref(),
                 )?;
                 let entries = fs.transform_for_boot(&repo)?;
-                let id = fs.commit_image(&repo, None)?;
+                let formats = repo.default_format_set();
+                let ids = fs.commit_images(&repo, None, formats)?;
+                // Prefer V1 digest; fall back to V2.
+                let id = ids
+                    .get(&FormatVersion::V1)
+                    .or_else(|| ids.get(&FormatVersion::V2))
+                    .ok_or_else(|| anyhow::anyhow!("commit_images produced no images"))?
+                    .clone();
+
+                let insecure = repo.is_insecure();
+                let karg = if formats.contains(FormatVersion::V1)
+                    && !formats.contains(FormatVersion::V2)
+                {
+                    // V1-only repo → composefs.digest= (with optional ? for insecure)
+                    ComposefsCmdline::new_v1(id, insecure)
+                } else {
+                    // BOTH or V2-only repo → composefs= (with optional ? for insecure)
+                    ComposefsCmdline::new_v2(id, insecure)
+                };
 
                 let Some(entry) = entries.into_iter().next() else {
                     anyhow::bail!("No boot entries!");
@@ -1223,8 +1319,7 @@ where
                 write_boot::write_boot_simple(
                     &repo,
                     entry,
-                    &id,
-                    repo.is_insecure(),
+                    &karg,
                     bootdir,
                     None,
                     entry_id.as_deref(),
@@ -1237,7 +1332,7 @@ where
                     .map(|p: &PathBuf| p.parent().unwrap())
                     .unwrap_or(Path::new("/sysroot"))
                     .join("state/deploy")
-                    .join(id.to_hex());
+                    .join(karg.digest().to_hex());
 
                 create_dir_all(state.join("var"))?;
                 create_dir_all(state.join("etc/upper"))?;
@@ -1272,9 +1367,13 @@ where
             let id = fs.commit_image(&repo, image_name.as_deref())?;
             println!("{}", id.to_id());
         }
-        Command::ComputeId { .. } | Command::CreateDumpfile { .. } => {
+        Command::ComputeId { .. }
+        | Command::ComputeKarg { .. }
+        | Command::CreateDumpfile { .. } => {
             // Handled in run_app before opening the repo
-            unreachable!("compute-id and create-dumpfile are dispatched without a repo");
+            unreachable!(
+                "compute-id, compute-karg, and create-dumpfile are dispatched without a repo"
+            );
         }
         Command::Mount { name, mountpoint } => {
             repo.mount_at(&name, &mountpoint)?;
