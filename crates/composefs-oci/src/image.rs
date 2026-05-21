@@ -16,6 +16,7 @@ use fn_error_context::context;
 use sha2::{Digest, Sha256};
 
 use composefs::{
+    erofs::format::FormatVersion,
     fsverity::FsVerityHashValue,
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Stat},
@@ -125,7 +126,7 @@ pub fn compute_per_layer_digests<ObjectID: FsVerityHashValue>(
         while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
             process_entry(&mut single_fs, entry)?;
         }
-        layer_digests.push(single_fs.compute_image_id());
+        layer_digests.push(single_fs.compute_image_id(FormatVersion::V1));
     }
 
     Ok(layer_digests)
@@ -146,7 +147,7 @@ pub fn compute_merged_digest<ObjectID: FsVerityHashValue>(
     config_verity: Option<&ObjectID>,
 ) -> Result<ObjectID> {
     let fs = create_filesystem(repo, config_name, config_verity)?;
-    Ok(fs.compute_image_id())
+    Ok(fs.compute_image_id(FormatVersion::V1))
 }
 
 /// Compute per-layer EROFS images and their fs-verity digests.
@@ -681,7 +682,7 @@ mod test {
         refs.insert(Box::from(diff_id.as_str()), layer_verity);
 
         let (config_digest, config_verity) =
-            crate::write_config(repo, &config, refs, None, None).unwrap();
+            crate::write_config(repo, &config, refs, None, None, None, None).unwrap();
         (config_digest, config_verity, diff_id)
     }
 
@@ -695,8 +696,7 @@ mod test {
         let (repo, _) = Repository::<Sha256HashValue>::init_path(
             CWD,
             &repo_dir,
-            composefs::fsverity::Algorithm::SHA256,
-            false,
+            composefs::repository::RepositoryConfig::default().set_insecure(),
         )
         .unwrap();
         let repo = Arc::new(repo);
@@ -734,8 +734,7 @@ mod test {
         let (repo, _) = Repository::<Sha256HashValue>::init_path(
             CWD,
             &repo_dir,
-            composefs::fsverity::Algorithm::SHA256,
-            false,
+            composefs::repository::RepositoryConfig::default().set_insecure(),
         )
         .unwrap();
         let repo = Arc::new(repo);
@@ -747,7 +746,7 @@ mod test {
         assert_eq!(per_layer.len(), 1);
 
         let merged_fs = create_filesystem(&repo, &config_digest, Some(&config_verity)).unwrap();
-        let merged_digest = merged_fs.compute_image_id();
+        let merged_digest = merged_fs.compute_image_id(FormatVersion::V1);
 
         // The merged filesystem applies transform_for_oci() which copies /usr metadata
         // to the root, so the digests should differ.

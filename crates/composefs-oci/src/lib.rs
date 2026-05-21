@@ -864,12 +864,17 @@ fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
     // manifest content hash hasn't changed. The splitstream named refs need
     // updating to point to the new config verity (which now includes the
     // EROFS image ref).
+    let layer_refs_vec: Vec<(Box<str>, ObjectID)> = img
+        .layer_refs()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     oci_image::rewrite_manifest(
         repo,
         new_manifest_json.as_bytes(),
         &new_manifest_digest,
         &new_config_verity,
-        img.layer_refs(),
+        &layer_refs_vec,
         tag,
     )?;
 
@@ -958,12 +963,17 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
     let new_manifest_json = new_manifest.to_string()?;
     let new_manifest_digest = crate::sha256_content_digest(new_manifest_json.as_bytes());
 
+    let layer_refs_vec: Vec<(Box<str>, ObjectID)> = img
+        .layer_refs()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     oci_image::rewrite_manifest(
         repo,
         new_manifest_json.as_bytes(),
         &new_manifest_digest,
         &new_config_verity,
-        img.layer_refs(),
+        &layer_refs_vec,
         tag,
     )?;
 
@@ -981,12 +991,14 @@ fn seal<ObjectID: FsVerityHashValue>(
         mut config,
         layer_refs,
         image_ref,
+        image_ref_v1,
         boot_image_ref,
+        boot_image_ref_v1,
     } = open_config(repo, config_name, config_verity)?;
     let mut myconfig = config.config().clone().unwrap_or_default();
     let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
     let fs = crate::image::create_filesystem(repo, config_name, config_verity)?;
-    let id = fs.compute_image_id();
+    let id = fs.compute_image_id(FormatVersion::V1);
     labels.insert("containers.composefs.fsverity".to_string(), id.to_hex());
     config.set_config(Some(myconfig));
     write_config(
@@ -994,7 +1006,9 @@ fn seal<ObjectID: FsVerityHashValue>(
         &config,
         layer_refs,
         image_ref.as_ref(),
+        image_ref_v1.as_ref(),
         boot_image_ref.as_ref(),
+        boot_image_ref_v1.as_ref(),
     )
 }
 

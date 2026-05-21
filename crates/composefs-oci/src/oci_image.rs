@@ -807,12 +807,17 @@ pub fn seal_image<ObjectID: FsVerityHashValue>(
     let new_manifest_json = new_manifest.to_string()?;
     let new_manifest_digest = crate::sha256_content_digest(new_manifest_json.as_bytes());
 
+    let layer_refs_vec: Vec<(Box<str>, ObjectID)> = img
+        .layer_refs()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     write_manifest(
         repo,
         &new_manifest,
         &new_manifest_digest,
         &sealed_config_verity,
-        img.layer_refs(),
+        &layer_refs_vec,
         Some(name),
     )?;
 
