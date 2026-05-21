@@ -1516,8 +1516,11 @@ where
                 println!("objects  {}", result.stats);
 
                 if bootable {
-                    let image_verity =
-                        composefs_oci::generate_boot_image(&repo, &result.manifest_digest)?;
+                    let image_verity = composefs_oci::generate_boot_image(
+                        &repo,
+                        &result.manifest_digest,
+                        Some(tag_name),
+                    )?;
                     println!("Boot image: {}", image_verity.to_hex());
                 }
 

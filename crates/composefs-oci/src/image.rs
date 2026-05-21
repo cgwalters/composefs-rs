@@ -16,7 +16,7 @@ use fn_error_context::context;
 use sha2::{Digest, Sha256};
 
 use composefs::{
-    erofs::writer::mkfs_erofs_versioned,
+    erofs::{format::FormatVersion, writer::mkfs_erofs_versioned},
     fsverity::{FsVerityHashValue, compute_verity},
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Stat},
@@ -126,7 +126,9 @@ pub fn compute_per_layer_digests<ObjectID: FsVerityHashValue>(
         while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
             process_entry(&mut single_fs, entry)?;
         }
-        layer_digests.push(single_fs.compute_image_id(repo.erofs_version()));
+        // Always use V1 for registry-distributed EROFS digests: must match
+        // the format used by generate_per_layer_images during signing.
+        layer_digests.push(single_fs.compute_image_id(FormatVersion::V1));
     }
 
     Ok(layer_digests)
@@ -138,6 +140,9 @@ pub fn compute_per_layer_digests<ObjectID: FsVerityHashValue>(
 /// This digest is deterministic for a given OCI image and is used in signature
 /// artifacts as the "merged" entry.
 ///
+/// Always uses V1 EROFS format to match `generate_merged_image` so that
+/// sign and verify always agree, regardless of the local repo's format setting.
+///
 /// If `config_verity` is given, it is used for fast lookup. Otherwise, the config
 /// and layers will be hashed to verify their content.
 #[context("Computing merged digest")]
@@ -147,7 +152,8 @@ pub fn compute_merged_digest<ObjectID: FsVerityHashValue>(
     config_verity: Option<&ObjectID>,
 ) -> Result<ObjectID> {
     let fs = create_filesystem(repo, config_name, config_verity)?;
-    Ok(fs.compute_image_id(repo.erofs_version()))
+    // Always V1 for registry-distributed artifacts (see compute_per_layer_digests).
+    Ok(fs.compute_image_id(FormatVersion::V1))
 }
 
 /// Compute per-layer EROFS images and their fs-verity digests.
@@ -181,8 +187,10 @@ pub fn generate_per_layer_images<ObjectID: FsVerityHashValue>(
         while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
             process_entry(&mut single_fs, entry)?;
         }
-        let version = repo.erofs_version();
-        let erofs_bytes = mkfs_erofs_versioned(&single_fs, version);
+        // Always use V1 for registry-distributed EROFS: it is the canonical,
+        // interoperable format that any verifier can check. V2 is a local
+        // efficiency optimization and must not appear in signed artifacts.
+        let erofs_bytes = mkfs_erofs_versioned(&single_fs, FormatVersion::V1);
         let digest = compute_verity(&erofs_bytes);
         results.push((erofs_bytes, digest));
     }
@@ -194,6 +202,9 @@ pub fn generate_per_layer_images<ObjectID: FsVerityHashValue>(
 ///
 /// This is the same as `compute_merged_digest` but preserves the raw EROFS
 /// bytes for inclusion in composefs artifacts.
+///
+/// Always uses V1 EROFS format, which is the canonical format for registry-
+/// distributed artifacts. V2 is a local efficiency optimization only.
 #[context("Generating merged EROFS image")]
 pub fn generate_merged_image<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
@@ -201,8 +212,8 @@ pub fn generate_merged_image<ObjectID: FsVerityHashValue>(
     config_verity: Option<&ObjectID>,
 ) -> Result<(Box<[u8]>, ObjectID)> {
     let fs = create_filesystem(repo, config_name, config_verity)?;
-    let version = repo.erofs_version();
-    let erofs_bytes = mkfs_erofs_versioned(&fs, version);
+    // Always V1 for registry-distributed artifacts (see generate_per_layer_images).
+    let erofs_bytes = mkfs_erofs_versioned(&fs, FormatVersion::V1);
     let digest = compute_verity(&erofs_bytes);
     Ok((erofs_bytes, digest))
 }
