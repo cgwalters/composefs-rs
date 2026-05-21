@@ -883,6 +883,8 @@ fn privileged_sign_and_verify_with_verity() -> Result<()> {
     let verity_dir = VerityTempDir::new()?;
     let repo = verity_dir.path().join("repo");
 
+    cmd!(sh, "{cfsctl} --repo {repo} init").run()?;
+
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
     pull_oci_image_verity(&sh, &cfsctl, &repo, &oci_layout, "test-image")?;
@@ -927,6 +929,8 @@ fn privileged_seal_then_sign() -> Result<()> {
     let cfsctl = cfsctl()?;
     let verity_dir = VerityTempDir::new()?;
     let repo = verity_dir.path().join("repo");
+
+    cmd!(sh, "{cfsctl} --repo {repo} init").run()?;
 
     let fixture_dir = tempfile::tempdir()?;
     let oci_layout = create_oci_layout(fixture_dir.path())?;
@@ -1018,6 +1022,8 @@ fn privileged_keyring_and_verify_with_verity() -> Result<()> {
     let repo = verity_dir.path().join("repo");
     let fixture_dir = tempfile::tempdir()?;
     let (cert, key) = generate_test_cert(fixture_dir.path())?;
+
+    cmd!(sh, "{cfsctl} --repo {repo} init").run()?;
 
     // Inject cert into kernel's .fs-verity keyring
     let add_output = cmd!(sh, "{cfsctl} keyring add-cert {cert}").read()?;
