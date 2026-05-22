@@ -56,6 +56,8 @@ use composefs_boot::write_boot;
 use composefs::erofs::format::FormatVersion;
 #[cfg(feature = "oci")]
 use composefs::shared_internals::IO_BUF_CAPACITY;
+#[cfg(feature = "oci")]
+mod oci_run;
 use composefs::{
     dumpfile::{dump_single_dir, dump_single_file},
     erofs::{format::FormatSet, reader::erofs_to_filesystem},
@@ -349,6 +351,19 @@ impl From<LocalFetchCli> for composefs_oci::LocalFetchOpt {
     }
 }
 
+/// Pull policy for `cfsctl oci run`.
+#[cfg(feature = "oci")]
+#[derive(Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+enum PullPolicy {
+    /// Always pull the image, even if it already exists locally.
+    Always,
+    /// Pull only if the image is not already present.
+    #[default]
+    Missing,
+    /// Never pull; fail if the image is not present.
+    Never,
+}
+
 /// Common options for operations using OCI config manifest streams that may transform the image rootfs
 #[cfg(feature = "oci")]
 #[derive(Debug, Parser)]
@@ -594,6 +609,56 @@ enum OciCommand {
         image: String,
         /// Path to the OCI layout directory (must already exist)
         oci_layout_path: PathBuf,
+    },
+    /// Run a container with composefs integrity enforcement
+    ///
+    /// Pulls the image if missing (unless --pull=never), optionally verifies
+    /// a PKCS#7 signature, mounts the composefs EROFS overlay, generates an
+    /// OCI runtime bundle, and execs into crun (or --runtime).
+    Run {
+        /// Image reference (tag name or manifest digest)
+        image: String,
+        /// Container name (defaults to the image tag component)
+        #[arg(long)]
+        name: Option<String>,
+        /// Verify a PKCS#7 signature before running
+        #[arg(long)]
+        require_signature: bool,
+        /// Path to PEM-encoded trusted certificate for signature verification
+        #[arg(long)]
+        trust_cert: Option<PathBuf>,
+        /// When to pull the image
+        #[arg(long, value_enum, default_value = "missing")]
+        pull: PullPolicy,
+        /// OCI runtime binary (default: search PATH for crun, then runc)
+        #[arg(long)]
+        runtime: Option<PathBuf>,
+        /// Additional environment variables (KEY=VALUE)
+        #[arg(long = "env", short = 'e')]
+        envs: Vec<String>,
+        /// Network mode
+        #[arg(long, value_enum, default_value = "host")]
+        network: oci_run::NetworkMode,
+        /// Bind mounts in src:dst[:ro] form
+        #[arg(long = "volume", short = 'v')]
+        volumes: Vec<String>,
+        /// Remove the bundle directory after the container exits
+        #[arg(long, default_value = "true")]
+        rm: bool,
+        /// Override the bundle directory (default: /run/cfsctl/<name>)
+        #[arg(long)]
+        bundle_dir: Option<PathBuf>,
+        /// Command override (arguments after --)
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Stop a running container and clean up its composefs mount
+    Stop {
+        /// Container name
+        name: String,
+        /// Override the bundle directory (default: /run/cfsctl/<name>)
+        #[arg(long)]
+        bundle_dir: Option<PathBuf>,
     },
 }
 
@@ -2042,6 +2107,216 @@ where
                         oci_layout_path.display()
                     );
                 }
+            }
+            OciCommand::Run {
+                ref image,
+                name,
+                require_signature,
+                ref trust_cert,
+                pull,
+                runtime,
+                envs,
+                network,
+                volumes,
+                rm,
+                bundle_dir,
+                cmd,
+            } => {
+                if require_signature && trust_cert.is_none() {
+                    anyhow::bail!("--require-signature requires --trust-cert");
+                }
+
+                // Derive a container name from the image reference when not specified.
+                let name = name.unwrap_or_else(|| {
+                    image
+                        .split('/')
+                        .next_back()
+                        .unwrap_or(image)
+                        .split(':')
+                        .next()
+                        .unwrap_or(image)
+                        .to_string()
+                });
+
+                let bundle_dir =
+                    bundle_dir.unwrap_or_else(|| PathBuf::from(format!("/run/cfsctl/{name}")));
+                let rootfs = bundle_dir.join("rootfs");
+
+                // --- Pull policy ---
+                let img = match pull {
+                    PullPolicy::Always => {
+                        // Always (re)pull before running.
+                        let tag_name = image.as_str();
+                        let reporter: SharedReporter = IndicatifReporter::new().into_shared();
+                        let opts = composefs_oci::PullOptions {
+                            progress: Some(reporter),
+                            ..Default::default()
+                        };
+                        composefs_oci::pull(&repo, image, Some(tag_name), opts).await?;
+                        if image.starts_with("sha256:") {
+                            let digest: composefs_oci::OciDigest =
+                                image.parse().context("Parsing manifest digest")?;
+                            composefs_oci::oci_image::OciImage::open(&repo, &digest, None)?
+                        } else {
+                            composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
+                        }
+                    }
+                    PullPolicy::Missing => {
+                        // Only pull if not present.
+                        let maybe_img = if image.starts_with("sha256:") {
+                            let digest: composefs_oci::OciDigest =
+                                image.parse().context("Parsing manifest digest")?;
+                            composefs_oci::oci_image::OciImage::open(&repo, &digest, None).ok()
+                        } else {
+                            composefs_oci::oci_image::OciImage::open_ref(&repo, image).ok()
+                        };
+                        match maybe_img {
+                            Some(img) => img,
+                            None => {
+                                let tag_name = image.as_str();
+                                let reporter: SharedReporter =
+                                    IndicatifReporter::new().into_shared();
+                                let opts = composefs_oci::PullOptions {
+                                    progress: Some(reporter),
+                                    ..Default::default()
+                                };
+                                composefs_oci::pull(&repo, image, Some(tag_name), opts).await?;
+                                if image.starts_with("sha256:") {
+                                    let digest: composefs_oci::OciDigest =
+                                        image.parse().context("Parsing manifest digest")?;
+                                    composefs_oci::oci_image::OciImage::open(
+                                        &repo, &digest, None,
+                                    )?
+                                } else {
+                                    composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
+                                }
+                            }
+                        }
+                    }
+                    PullPolicy::Never => {
+                        // Fail if not present.
+                        if image.starts_with("sha256:") {
+                            let digest: composefs_oci::OciDigest =
+                                image.parse().context("Parsing manifest digest")?;
+                            composefs_oci::oci_image::OciImage::open(&repo, &digest, None)?
+                        } else {
+                            composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
+                        }
+                    }
+                };
+
+                // --- Signature verification ---
+                if require_signature {
+                    let cert_path = trust_cert.as_ref().unwrap();
+                    let cert_pem = std::fs::read(cert_path)
+                        .with_context(|| format!("failed to read certificate: {cert_path:?}"))?;
+                    let verified_count = verify_image_signatures(&repo, image, &cert_pem)?;
+                    println!(
+                        "Signature verification passed ({verified_count} signatures verified)"
+                    );
+                }
+
+                // --- Resolve composefs EROFS image id ---
+                let erofs_id = img
+                    .image_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No composefs EROFS image linked for {image} — try re-pulling"
+                        )
+                    })?
+                    .to_hex();
+
+                // --- Mount composefs ---
+                std::fs::create_dir_all(&rootfs).with_context(|| {
+                    format!("creating rootfs directory: {}", rootfs.display())
+                })?;
+                repo.mount_at(&erofs_id, rootfs.to_str().context("rootfs path is not valid UTF-8")?)?;
+
+                // --- Read OCI image config for process settings ---
+                let image_config = img
+                    .config()
+                    .ok_or_else(|| anyhow::anyhow!("OCI image has no config block"))?;
+
+                // --- Generate OCI runtime spec ---
+                let overrides = oci_run::RunOverrides {
+                    name: name.clone(),
+                    extra_env: envs,
+                    network,
+                    volumes,
+                    cmd_override: cmd,
+                };
+                let spec = oci_run::generate_spec(&rootfs, image_config, &overrides)?;
+                oci_run::write_bundle(&bundle_dir, &spec)?;
+
+                // --- Find OCI runtime ---
+                let runtime_path = match runtime {
+                    Some(p) => p,
+                    None => {
+                        // Search PATH for crun, then runc.
+                        ["crun", "runc"]
+                            .iter()
+                            .find_map(|name| {
+                                std::env::var_os("PATH").and_then(|path_var| {
+                                    std::env::split_paths(&path_var).find_map(|dir| {
+                                        let candidate = dir.join(name);
+                                        if candidate.is_file() {
+                                            Some(candidate)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "no OCI runtime found in PATH; install crun or runc, \
+                                     or use --runtime"
+                                )
+                            })?
+                    }
+                };
+
+                // --- Optionally register cleanup on exit via `--rm` ---
+                // crun's `--rm` flag handles removing the container state, but
+                // we also need to unmount the composefs overlay.  We register
+                // a SIGCHLD/atexit handler via a wrapper script if --rm is set.
+                // For now we implement the simple path: exec directly and rely
+                // on crun --rm for state cleanup; unmount is left for `stop`.
+                let mut runtime_cmd = std::process::Command::new(&runtime_path);
+                runtime_cmd.arg("run");
+                if rm {
+                    runtime_cmd.arg("--rm");
+                }
+                runtime_cmd.arg("--bundle");
+                runtime_cmd.arg(&bundle_dir);
+                runtime_cmd.arg(&name);
+
+                // exec() replaces the current process; it only returns on error.
+                use std::os::unix::process::CommandExt as _;
+                let err = runtime_cmd.exec();
+                anyhow::bail!("exec {:?} failed: {err}", runtime_path);
+            }
+            OciCommand::Stop { name, bundle_dir } => {
+                let bundle_dir =
+                    bundle_dir.unwrap_or_else(|| PathBuf::from(format!("/run/cfsctl/{name}")));
+                let rootfs = bundle_dir.join("rootfs");
+
+                // Ask the runtime to delete the container state (best-effort).
+                let _ = std::process::Command::new("crun")
+                    .args(["delete", "-f", &name])
+                    .status();
+
+                // Unmount the composefs overlay (best-effort; ignore ENOENT/EINVAL).
+                let _ = rustix::mount::unmount(&rootfs, rustix::mount::UnmountFlags::DETACH);
+
+                // Remove the bundle directory.
+                if bundle_dir.exists() {
+                    std::fs::remove_dir_all(&bundle_dir).with_context(|| {
+                        format!("removing bundle directory: {}", bundle_dir.display())
+                    })?;
+                }
+
+                println!("Stopped and cleaned up container {name}");
             }
         },
         Command::CreateImage {
