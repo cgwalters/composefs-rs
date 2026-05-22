@@ -1688,3 +1688,74 @@ fn test_compute_image_id() -> Result<()> {
     Ok(())
 }
 integration_test!(test_compute_image_id);
+
+/// Helper to compress an existing OCI image layout using skopeo.
+fn oci_compress(sh: &Shell, src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    cmd!(
+        sh,
+        "skopeo copy --dest-compress-format gzip oci:{src} oci:{dest}"
+    )
+    .run()?;
+    Ok(())
+}
+
+/// Test that layers are reused across different compression formats.
+///
+/// When the same tar content is stored once uncompressed (our standard test image) and once
+/// gzip-compressed (using skopeo to compress), the composefs repository should recognise that the
+/// uncompressed content (diffid) is identical and skip re-importing
+/// the layer on the second pull.
+fn test_layer_reuse_across_compression() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+
+    // Reuse our existing test image layout (uncompressed)
+    let oci_uncompressed = create_oci_layout(fixture_dir.path())?;
+
+    // Create a gzip-compressed layout from it using skopeo
+    let oci_gzip = fixture_dir.path().join("oci-gzip");
+    oci_compress(&sh, &oci_uncompressed, &oci_gzip)?;
+
+    // Pull the uncompressed layout first
+    let pull1_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_uncompressed} image-uncompressed"
+    )
+    .read()?;
+    assert!(
+        pull1_output.contains("manifest sha256:"),
+        "first pull should succeed, got: {pull1_output}"
+    );
+
+    // Pull the gzip-compressed layout second — layer content is identical
+    let pull2_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_gzip} image-gzip"
+    )
+    .read()?;
+    assert!(
+        pull2_output.contains("manifest sha256:"),
+        "second pull should succeed, got: {pull2_output}"
+    );
+
+    // Extract the "objects" line from the second pull.
+    // When the layer is fully reused the stats should report
+    // zero new objects (0 new + N already present).
+    let objects_line = pull2_output
+        .lines()
+        .find(|l| l.starts_with("objects"))
+        .expect("expected 'objects' line in pull output");
+
+    // The objects line should show "0 new" — no copied/reflinked/hardlinked objects
+    assert!(
+        objects_line.contains("0 new"),
+        "second pull should reuse all objects (layer reuse across compression), \
+         but got: {objects_line}"
+    );
+
+    Ok(())
+}
+integration_test!(test_layer_reuse_across_compression);
