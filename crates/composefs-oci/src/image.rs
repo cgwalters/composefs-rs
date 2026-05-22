@@ -16,7 +16,7 @@ use fn_error_context::context;
 use sha2::{Digest, Sha256};
 
 use composefs::{
-    erofs::{format::FormatVersion, writer::mkfs_erofs_versioned},
+    erofs::{format::FormatVersion, writer::{ValidatedFileSystem, mkfs_erofs_versioned}},
     fsverity::{FsVerityHashValue, compute_verity},
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Stat},
@@ -190,7 +190,7 @@ pub fn generate_per_layer_images<ObjectID: FsVerityHashValue>(
         // Always use V1 for registry-distributed EROFS: it is the canonical,
         // interoperable format that any verifier can check. V2 is a local
         // efficiency optimization and must not appear in signed artifacts.
-        let erofs_bytes = mkfs_erofs_versioned(&single_fs, FormatVersion::V1);
+        let erofs_bytes = mkfs_erofs_versioned(&ValidatedFileSystem::new(single_fs)?, FormatVersion::V1);
         let digest = compute_verity(&erofs_bytes);
         results.push((erofs_bytes, digest));
     }
@@ -213,7 +213,7 @@ pub fn generate_merged_image<ObjectID: FsVerityHashValue>(
 ) -> Result<(Box<[u8]>, ObjectID)> {
     let fs = create_filesystem(repo, config_name, config_verity)?;
     // Always V1 for registry-distributed artifacts (see generate_per_layer_images).
-    let erofs_bytes = mkfs_erofs_versioned(&fs, FormatVersion::V1);
+    let erofs_bytes = mkfs_erofs_versioned(&ValidatedFileSystem::new(fs)?, FormatVersion::V1);
     let digest = compute_verity(&erofs_bytes);
     Ok((erofs_bytes, digest))
 }
@@ -287,7 +287,6 @@ mod test {
     use composefs::{
         dumpfile::write_dumpfile,
         fsverity::Sha256HashValue,
-        repository::RepositoryConfig,
         tree::{LeafContent, RegularFile, Stat},
     };
     use std::{

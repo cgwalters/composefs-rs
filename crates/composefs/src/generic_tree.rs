@@ -511,15 +511,6 @@ impl<T> Directory<T> {
         }
     }
 
-    /// Retains only top-level entries whose names satisfy the predicate.
-    /// This is used for filtering dump output to specific entries.
-    pub fn retain_top_level(&mut self, mut f: impl FnMut(&str) -> bool) {
-        self.entries.retain(|name, _| {
-            // Convert OsStr to str for comparison; non-UTF8 names never match
-            name.to_str().is_some_and(&mut f)
-        });
-    }
-
     /// Recursively finds the newest modification time in this directory tree.
     ///
     /// Returns the maximum modification time among this directory's metadata

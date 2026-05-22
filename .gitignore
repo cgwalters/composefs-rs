@@ -8,3 +8,4 @@
 .worktrees
 *.rpm
 docs/
+fetch_all.py
