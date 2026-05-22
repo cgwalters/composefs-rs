@@ -2211,7 +2211,7 @@ where
 
                 // --- Signature verification ---
                 if require_signature {
-                    let cert_path = trust_cert.as_ref().unwrap();
+                    let cert_path = trust_cert.as_ref().expect("trust_cert checked above");
                     let cert_pem = std::fs::read(cert_path)
                         .with_context(|| format!("failed to read certificate: {cert_path:?}"))?;
                     let verified_count = verify_image_signatures(&repo, image, &cert_pem)?;
@@ -2236,10 +2236,24 @@ where
                 })?;
                 repo.mount_at(&erofs_id, rootfs.to_str().context("rootfs path is not valid UTF-8")?)?;
 
+                // Cleanup helper: unmount and remove bundle if anything below
+                // fails before exec() hands off to the runtime.
+                let cleanup = || {
+                    let _ = rustix::mount::unmount(&rootfs, rustix::mount::UnmountFlags::DETACH);
+                    let _ = std::fs::remove_dir_all(&bundle_dir);
+                };
+
                 // --- Read OCI image config for process settings ---
-                let image_config = img
+                let image_config = match img
                     .config()
-                    .ok_or_else(|| anyhow::anyhow!("OCI image has no config block"))?;
+                    .ok_or_else(|| anyhow::anyhow!("OCI image has no config block"))
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        cleanup();
+                        return Err(e);
+                    }
+                };
 
                 // --- Generate OCI runtime spec ---
                 let overrides = oci_run::RunOverrides {
@@ -2249,8 +2263,17 @@ where
                     volumes,
                     cmd_override: cmd,
                 };
-                let spec = oci_run::generate_spec(&rootfs, image_config, &overrides)?;
-                oci_run::write_bundle(&bundle_dir, &spec)?;
+                let spec = match oci_run::generate_spec(&rootfs, image_config, &overrides) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        cleanup();
+                        return Err(e);
+                    }
+                };
+                if let Err(e) = oci_run::write_bundle(&bundle_dir, &spec) {
+                    cleanup();
+                    return Err(e);
+                }
 
                 // --- Find OCI runtime ---
                 let runtime_path = match runtime {
@@ -2298,6 +2321,8 @@ where
                 // exec() replaces the current process; it only returns on error.
                 use std::os::unix::process::CommandExt as _;
                 let err = runtime_cmd.exec();
+                // exec failed — clean up the mount we created.
+                cleanup();
                 anyhow::bail!("exec {:?} failed: {err}", runtime_path);
             }
             OciCommand::Stop { name, bundle_dir } => {

@@ -66,17 +66,30 @@ pub fn parse_volume(vol: &str) -> Result<Mount> {
 
 /// Parse a `user` string from the OCI image config into `(uid, gid)`.
 ///
-/// Understands `uid`, `uid:gid`, `username` (mapped to 0), etc.
-/// For anything that isn't a numeric UID we fall back to 0:0 — proper
-/// `/etc/passwd` lookup would require entering the container's rootfs,
-/// which is the runtime's job.
+/// Understands `uid`, `uid:gid`, and numeric-only forms.
+/// NOTE: Named user resolution (e.g. "nobody") requires reading the
+/// container's /etc/passwd, which is the OCI runtime's responsibility.
+/// We emit a warning and fall back to uid/gid 0 for named users.
 fn parse_user(user_str: &str) -> (u32, u32) {
+    if user_str.is_empty() {
+        return (0, 0);
+    }
     let parts: Vec<&str> = user_str.splitn(2, ':').collect();
-    let uid = parts[0].parse::<u32>().unwrap_or(0);
-    let gid = parts
-        .get(1)
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
+    let uid = match parts[0].parse::<u32>() {
+        Ok(u) => u,
+        Err(_) => {
+            // Named users (e.g. "nobody") require resolving via the container's
+            // /etc/passwd — not yet implemented. Defaulting to uid 0 (root).
+            eprintln!(
+                "cfsctl: warning: cannot resolve user {:?} to UID; \
+                 named user resolution requires reading the container rootfs. \
+                 Running as root (uid=0).",
+                parts[0]
+            );
+            0
+        }
+    };
+    let gid = parts.get(1).and_then(|g| g.parse::<u32>().ok()).unwrap_or(uid);
     (uid, gid)
 }
 
@@ -129,6 +142,7 @@ fn standard_mounts() -> Vec<Mount> {
                 "newinstance".to_string(),
                 "ptmxmode=0666".to_string(),
                 "mode=0620".to_string(),
+                "gid=5".to_string(),
             ])
             .build()
             .expect("devpts mount"),
@@ -326,6 +340,121 @@ pub fn generate_spec(
         .context("building OCI runtime spec")?;
 
     Ok(spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_parse_volume_basic() {
+        let m = parse_volume("src:dst").unwrap();
+        assert_eq!(
+            m.source().as_deref(),
+            Some(Path::new("src")),
+        );
+        assert_eq!(m.destination(), Path::new("dst"));
+        assert!(!m.options().as_deref().unwrap_or(&[]).contains(&"ro".to_string()));
+    }
+
+    #[test]
+    fn test_parse_volume_readonly() {
+        let m = parse_volume("src:dst:ro").unwrap();
+        assert!(m.options().as_deref().unwrap_or(&[]).contains(&"ro".to_string()));
+    }
+
+    #[test]
+    fn test_parse_volume_malformed() {
+        assert!(parse_volume("nodst").is_err());
+    }
+
+    #[test]
+    fn test_parse_user_numeric() {
+        assert_eq!(parse_user("1000"), (1000, 1000));
+        assert_eq!(parse_user("1000:2000"), (1000, 2000));
+        assert_eq!(parse_user("0"), (0, 0));
+        assert_eq!(parse_user(""), (0, 0));
+    }
+
+    #[test]
+    fn test_parse_user_named_falls_back_to_root() {
+        // Named users fall back to uid=0 with a warning
+        let (uid, gid) = parse_user("nobody");
+        assert_eq!((uid, gid), (0, 0));
+    }
+
+    #[test]
+    fn test_generate_spec_host_network_has_no_network_ns() {
+        use oci_spec::image::{ConfigBuilder, ImageConfigurationBuilder};
+        let config = ImageConfigurationBuilder::default()
+            .config(
+                ConfigBuilder::default()
+                    .cmd(vec!["/bin/sh".to_string()])
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let overrides = RunOverrides {
+            name: "test".to_string(),
+            extra_env: vec![],
+            network: NetworkMode::Host,
+            volumes: vec![],
+            cmd_override: vec![],
+        };
+        let spec = generate_spec(Path::new("/rootfs"), &config, &overrides).unwrap();
+        let namespaces = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .namespaces()
+            .as_deref()
+            .unwrap_or(&[]);
+        let has_net_ns = namespaces
+            .iter()
+            .any(|n| n.typ() == LinuxNamespaceType::Network);
+        assert!(
+            !has_net_ns,
+            "Host network mode should not create a network namespace"
+        );
+    }
+
+    #[test]
+    fn test_generate_spec_none_network_has_network_ns() {
+        use oci_spec::image::{ConfigBuilder, ImageConfigurationBuilder};
+        let config = ImageConfigurationBuilder::default()
+            .config(
+                ConfigBuilder::default()
+                    .cmd(vec!["/bin/sh".to_string()])
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let overrides = RunOverrides {
+            name: "test".to_string(),
+            extra_env: vec![],
+            network: NetworkMode::None,
+            volumes: vec![],
+            cmd_override: vec![],
+        };
+        let spec = generate_spec(Path::new("/rootfs"), &config, &overrides).unwrap();
+        let namespaces = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .namespaces()
+            .as_deref()
+            .unwrap_or(&[]);
+        let has_net_ns = namespaces
+            .iter()
+            .any(|n| n.typ() == LinuxNamespaceType::Network);
+        assert!(
+            has_net_ns,
+            "None network mode should create an isolated network namespace"
+        );
+    }
 }
 
 /// Write an OCI runtime bundle to `bundle_dir`.
