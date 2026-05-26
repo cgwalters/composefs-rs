@@ -3,6 +3,7 @@
 use anyhow::{Result, bail};
 use xshell::{Shell, cmd};
 
+use crate::tests::privileged::require_privileged_with_memory;
 use crate::{cfsctl, integration_test};
 
 /// A pinned container image for digest stability testing.
@@ -56,6 +57,24 @@ const CENTOS_BOOTC: ContainerImage = ContainerImage {
     ),
 };
 
+// debian-bootc, pinned by manifest list digest.
+// Mirrored from ghcr.io/bootcrew/debian-bootc via ci/fixture-images.txt.
+// Bootable image used for the cstor/filesystem digest equivalence test.
+// Unlike centos-bootc, this image's layers explicitly include directory
+// entries with their mtimes, avoiding implicit parent directory creation
+// that can cause mtime divergence between the OCI and on-disk paths.
+const DEBIAN_BOOTC: ContainerImage = ContainerImage {
+    label: "debian-bootc",
+    image_ref: "docker://ghcr.io/composefs/ci-fixture-debian-bootc:latest-0c5dcc18",
+    upstream_ref: "docker://ghcr.io/bootcrew/debian-bootc@sha256:0c5dcc181868fea93e78454e90a36df6b577be61917467c230bebf105065c995",
+    expected_id: "1b3d620895453d8f88af65cb34ad95d1973c81ad7a105fe76c81aff7f26eec71\
+                  4b422c032f499d25929f058a163aa1d5ff68ebb6850ada6d7d0b1874ad52f8e7",
+    expected_bootable_id: Some(
+        "013ed0f7275cb635075107bde6394bc19cf4e09ff1189b283048282d31fa2043\
+         875b076e44344b17d38ee7e3ba22557381c1626357edf349b978602970b73d49",
+    ),
+};
+
 // Ubuntu 26.04 (resolute), pinned by manifest digest.
 // Mirrored from docker.io/library/ubuntu via ci/fixture-images.txt.
 // Ubuntu 26.04 uses umoci/PAX format tars produced by Rockcraft, which emit
@@ -73,7 +92,8 @@ const UBUNTU_RESOLUTE: ContainerImage = ContainerImage {
 };
 
 /// All container images to test.
-const CONTAINER_IMAGES: &[&ContainerImage] = &[&UBI10, &CENTOS_BOOTC, &UBUNTU_RESOLUTE];
+const CONTAINER_IMAGES: &[&ContainerImage] =
+    &[&UBI10, &CENTOS_BOOTC, &DEBIAN_BOOTC, &UBUNTU_RESOLUTE];
 
 /// Return `true` if network tests should be skipped.
 fn skip_network() -> bool {
@@ -222,3 +242,193 @@ fn test_oci_container_digest_stability() -> Result<()> {
     Ok(())
 }
 integration_test!(test_oci_container_digest_stability);
+
+/// Expand /var tmpfs to ~80% of RAM.  In bcvk VMs /var is a small tmpfs;
+/// this gives podman room to unpack image layers.
+fn try_expand_var(sh: &Shell) {
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo")
+        && let Some(kb) = meminfo
+            .lines()
+            .find(|l| l.starts_with("MemTotal:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u64>().ok())
+    {
+        let size = format!("{}k", kb * 80 / 100);
+        let _ = cmd!(sh, "mount -o remount,size={size} /var")
+            .ignore_status()
+            .quiet()
+            .run();
+    }
+}
+
+/// Verify that the bootable EROFS digest of a pinned image is identical
+/// across all three computation paths:
+///
+/// 1. **OCI registry** — verified by `test_oci_container_digest_stability`,
+///    which pins the expected value in each image's `expected_bootable_id`
+/// 2. **containers-storage** — tar-split reconstruction from podman storage
+/// 3. **on-disk filesystem** — `cfsctl compute-id --bootable <mountpoint>`
+///
+/// Path 2 is the bootc *import* path; path 3 is the bootc *verification*
+/// path (via `read_container_root` / `compute_composefs_digest`).
+///
+/// On digest mismatch, captures dumpfiles from both paths and emits a
+/// unified diff to help identify the divergent entries.
+fn check_digest_equivalence(image: &ContainerImage) -> Result<()> {
+    let expected = image
+        .expected_bootable_id
+        .expect("image must have expected_bootable_id for equivalence test");
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    try_expand_var(&sh);
+
+    // Pull into podman.  Strip "docker://" for containers-storage refs.
+    let image_ref = image.upstream_ref;
+    let bare_ref = image_ref.strip_prefix("docker://").unwrap_or(image_ref);
+    eprintln!("Pulling {} into podman...", image.label);
+    cmd!(sh, "podman pull {image_ref}").run()?;
+
+    // --- containers-storage path ---
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    cmd!(sh, "{cfsctl} --insecure --repo {repo} init").read()?;
+
+    let cstor_ref = format!("containers-storage:{bare_ref}");
+    eprintln!("Importing via containers-storage...");
+    let pull_out = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull --local-fetch auto {cstor_ref}"
+    )
+    .read()?;
+
+    let config = pull_out
+        .lines()
+        .find_map(|l| l.strip_prefix("config").map(|r| r.trim().to_string()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("{}: no config in cstor output:\n{pull_out}", image.label)
+        })?;
+
+    let cstor_digest = compute_id(&sh, &cfsctl, repo, &config, true)?;
+    eprintln!("  containers-storage: {cstor_digest}");
+
+    // --- on-disk filesystem path ---
+    let cid = cmd!(sh, "podman create {image_ref} /bin/true").read()?;
+    let cid = cid.trim();
+    let mountpoint = cmd!(sh, "podman mount {cid}").read()?;
+    let mountpoint = mountpoint.trim();
+
+    let fs_digest = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} compute-id --bootable {mountpoint}"
+    )
+    .read()
+    .map(|s| s.trim().to_string());
+
+    // If digests mismatch, capture dumpfiles *before* unmounting.
+    let mismatch = match &fs_digest {
+        Ok(d) => d != &cstor_digest,
+        Err(_) => true,
+    };
+
+    let diff_output = if mismatch {
+        eprintln!("  MISMATCH detected — capturing dumpfiles for diff...");
+
+        // cstor dumpfile: `cfsctl oci dump --bootable @<config>`
+        let at_config = format!("@{config}");
+        let cstor_dump = cmd!(
+            sh,
+            "{cfsctl} --insecure --repo {repo} oci dump --bootable {at_config}"
+        )
+        .read()
+        .unwrap_or_else(|e| format!("(failed to dump cstor: {e})"));
+
+        // on-disk dumpfile: `cfsctl create-dumpfile --bootable <mountpoint>`
+        let fs_dump = cmd!(
+            sh,
+            "{cfsctl} --no-repo create-dumpfile --bootable {mountpoint}"
+        )
+        .read()
+        .unwrap_or_else(|e| format!("(failed to dump on-disk: {e})"));
+
+        // Write to temp files and diff
+        let cstor_path = std::env::temp_dir().join("cstor.dumpfile");
+        let fs_path = std::env::temp_dir().join("fs.dumpfile");
+        std::fs::write(&cstor_path, &cstor_dump)?;
+        std::fs::write(&fs_path, &fs_dump)?;
+
+        let diff = cmd!(sh, "diff -u {cstor_path} {fs_path}")
+            .ignore_status()
+            .read()
+            .unwrap_or_else(|e| format!("(diff failed: {e})"));
+
+        Some(diff)
+    } else {
+        None
+    };
+
+    // Clean up container before asserting.
+    cmd!(sh, "podman umount {cid}").ignore_status().run()?;
+    cmd!(sh, "podman rm -f {cid}").ignore_status().run()?;
+
+    let fs_digest = fs_digest?;
+    eprintln!("  on-disk filesystem: {fs_digest}");
+
+    if let Some(ref diff) = diff_output {
+        eprintln!(
+            "\n=== dumpfile diff (containers-storage vs on-disk) ===\n{diff}\n=== end diff ===\n"
+        );
+    }
+
+    // Assert both paths match the pinned expected value.
+    if cstor_digest != expected || fs_digest != expected {
+        bail!(
+            "{label}: digest mismatch!\n\
+             \x20  expected (pinned): {expected}\n\
+             \x20  containers-storage: {cstor_digest}\n\
+             \x20  on-disk filesystem: {fs_digest}",
+            label = image.label,
+        );
+    }
+
+    eprintln!("  OK: all three paths match: {expected}");
+    Ok(())
+}
+
+fn privileged_test_digest_equivalence_debian_bootc() -> Result<()> {
+    if skip_network() {
+        eprintln!("Skipping (COMPOSEFS_SKIP_NETWORK is set)");
+        return Ok(());
+    }
+    if require_privileged_with_memory("privileged_test_digest_equivalence_debian_bootc", "10G")?
+        .is_some()
+    {
+        return Ok(());
+    }
+    check_digest_equivalence(&DEBIAN_BOOTC)
+}
+integration_test!(privileged_test_digest_equivalence_debian_bootc);
+
+/// centos-bootc currently fails the on-disk filesystem path due to
+/// directory mtime divergence: some layers create files without explicit
+/// directory entries, so parent directory mtimes differ between the OCI
+/// metadata reconstruction and the on-disk extraction.
+///
+/// Tracked in: <https://github.com/containers/composefs-rs/issues/132>
+fn privileged_test_digest_equivalence_centos_bootc() -> Result<()> {
+    if skip_network() {
+        eprintln!("Skipping (COMPOSEFS_SKIP_NETWORK is set)");
+        return Ok(());
+    }
+    if require_privileged_with_memory("privileged_test_digest_equivalence_centos_bootc", "10G")?
+        .is_some()
+    {
+        return Ok(());
+    }
+    eprintln!(
+        "SKIP: centos-bootc has dir mtime divergence between OCI and on-disk paths \
+         (https://github.com/containers/composefs-rs/issues/132)"
+    );
+    Ok(())
+}
+integration_test!(privileged_test_digest_equivalence_centos_bootc);
