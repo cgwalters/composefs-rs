@@ -58,16 +58,16 @@ patch: clone
         exit 1
     fi
 
-    cfs_path="$_COMPOSEFS_SRC/crates/cfsctl"
+    cfs_path="$_COMPOSEFS_SRC/crates/composefs-ctl"
 
     cd "$COMPOSEFS_BOOTC_PATH"
 
     # Add or update the [patch] section with a path override
-    patch_value="cfsctl = { path = \"${cfs_path}\" } # Patched by composefs-rs"
+    patch_value="composefs-ctl = { path = \"${cfs_path}\" } # Patched by composefs-rs"
     if grep -q '^[[:space:]]*\[patch\."https://github.com/composefs/composefs-rs"\]' Cargo.toml; then
-        # Patch section already exists (uncommented) — replace the cfsctl line
+        # Patch section already exists (uncommented) — replace the composefs-ctl line
         sed -i '/^[[:space:]]*\[patch\."https:\/\/github.com\/composefs\/composefs-rs"\]/,/^$\|^\[/{
-            s|^cfsctl = .*|'"$patch_value"'|
+            s|^composefs-ctl = .*|'"$patch_value"'|
         }' Cargo.toml
     else
         # No patch section yet — append one
@@ -111,6 +111,11 @@ test bootloader="systemd" filesystem="ext4" boot_type="uki" seal_state="sealed":
     set -euo pipefail
     cd "$COMPOSEFS_BOOTC_PATH"
     echo "Running bootc composefs tests (bootloader={{bootloader}}, filesystem={{filesystem}}, boot_type={{boot_type}}, seal_state={{seal_state}})..."
+    # Export as env vars so they propagate through @just sub-invocations
+    # (just variable overrides don't propagate to child `just` processes,
+    # but bootc's Justfile reads these from BOOTC_* env vars)
+    export BOOTC_boot_type={{boot_type}}
+    export BOOTC_seal_state={{seal_state}}
     just test-composefs {{bootloader}} {{filesystem}} {{boot_type}} {{seal_state}}
 
 # Clean the bootc checkout and any patches.
