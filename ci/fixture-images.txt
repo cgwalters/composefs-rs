@@ -17,6 +17,12 @@ docker://registry.access.redhat.com/ubi10/ubi:10.1-1772441712 docker://ghcr.io/c
 # Used in: crates/integration-tests/src/tests/digest_stability.rs
 docker://quay.io/centos-bootc/centos-bootc@sha256:d1913e3d616b9acb7fc2e3331be8baf844048bca2681a23d34e53e75eb18f3d0 docker://ghcr.io/composefs/ci-fixture-centos-bootc:stream10-d1913e3d
 
+# debian-bootc, pinned by manifest list digest.
+# Used in: crates/integration-tests/src/tests/digest_stability.rs
+# Bootable image whose layers explicitly include directory entries with
+# their mtimes, so the OCI and on-disk digest computation paths agree.
+docker://ghcr.io/bootcrew/debian-bootc@sha256:0c5dcc181868fea93e78454e90a36df6b577be61917467c230bebf105065c995 docker://ghcr.io/composefs/ci-fixture-debian-bootc:latest-0c5dcc18
+
 # Ubuntu 26.04 (resolute), pinned by manifest digest.
 # Uses umoci/PAX format tars with GNU record padding — specifically exercises
 # the trailing-padding preservation fix in split_async().

@@ -34,6 +34,14 @@ use crate::{cfsctl, integration_test};
 /// This is also used by cstor tests which need user namespace support
 /// (via `podman unshare`) that may not be available on GHA runners.
 pub fn require_privileged(test_name: &str) -> Result<Option<()>> {
+    require_privileged_with_memory(test_name, "4G")
+}
+
+/// Like [`require_privileged`], but allows specifying VM memory size.
+///
+/// Tests that pull large container images inside the VM may need more
+/// memory since `/var` is backed by tmpfs.
+pub fn require_privileged_with_memory(test_name: &str, memory: &str) -> Result<Option<()>> {
     if rustix::process::getuid().is_root() {
         return Ok(None);
     }
@@ -54,7 +62,7 @@ pub fn require_privileged(test_name: &str) -> Result<Option<()>> {
     let bcvk = std::env::var("BCVK_PATH").unwrap_or_else(|_| "bcvk".into());
     cmd!(
         sh,
-        "{bcvk} ephemeral run-ssh {image} -- cfsctl-integration-tests --exact {test_name}"
+        "{bcvk} ephemeral run-ssh --memory {memory} {image} -- cfsctl-integration-tests --exact {test_name}"
     )
     .run()?;
     Ok(Some(()))
