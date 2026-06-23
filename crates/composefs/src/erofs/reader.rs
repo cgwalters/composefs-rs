@@ -1327,17 +1327,22 @@ pub struct ObjectCollector<ObjectID: FsVerityHashValue> {
 
 impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
     fn visit_xattr(&mut self, attr: &XAttr) -> Result<(), ErofsReaderError> {
-        // This is the index of "trusted".  See XATTR_PREFIXES in format.rs.
         if attr.header.name_index != 4 {
             return Ok(());
         }
-        if attr.suffix()? != b"overlay.metacopy" {
-            return Ok(());
-        }
-        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()?)
-            && value.valid()
-        {
-            self.objects.insert(value.digest);
+        let suffix = attr.suffix()?;
+        if suffix == b"overlay.metacopy" {
+            if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()?)
+                && value.valid()
+            {
+                self.objects.insert(value.digest);
+            }
+        } else if suffix == b"overlay.redirect" {
+            let value = attr.value()?;
+            let path = value.strip_prefix(b"/").unwrap_or(value);
+            if let Ok(id) = ObjectID::from_object_pathname(path) {
+                self.objects.insert(id);
+            }
         }
         Ok(())
     }
@@ -1586,6 +1591,50 @@ fn extract_metacopy_digest<ObjectID: FsVerityHashValue>(
     Ok(None)
 }
 
+/// Try to extract the object ID from a redirect xattr (`trusted.overlay.redirect`).
+///
+/// The redirect value is a path like `/55/90e94b...` from which we parse
+/// the object ID.  Returns `None` if no redirect xattr is present.
+fn extract_redirect_object_id<ObjectID: FsVerityHashValue>(
+    img: &Image,
+    inode: &InodeType,
+) -> anyhow::Result<Option<ObjectID>> {
+    let Some(xattrs_section) = inode.xattrs()? else {
+        return Ok(None);
+    };
+
+    for id in xattrs_section.shared()? {
+        let xattr = img.shared_xattr(id.get())?;
+        if let Some(obj) = check_redirect_xattr(xattr)? {
+            return Ok(Some(obj));
+        }
+    }
+    for xattr in xattrs_section.local()? {
+        let xattr = xattr?;
+        if let Some(obj) = check_redirect_xattr(xattr)? {
+            return Ok(Some(obj));
+        }
+    }
+    Ok(None)
+}
+
+fn check_redirect_xattr<ObjectID: FsVerityHashValue>(
+    xattr: &XAttr,
+) -> anyhow::Result<Option<ObjectID>> {
+    if xattr.header.name_index != 4 {
+        return Ok(None);
+    }
+    if xattr.suffix()? != b"overlay.redirect" {
+        return Ok(None);
+    }
+    let value = xattr.value()?;
+    let path = value.strip_prefix(b"/").unwrap_or(value);
+    match ObjectID::from_object_pathname(path) {
+        Ok(id) => Ok(Some(id)),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Check if a single xattr is a valid overlay.metacopy and return the digest.
 ///
 /// When `strict` is true, a `trusted.overlay.metacopy` xattr that cannot be
@@ -1604,6 +1653,9 @@ fn check_metacopy_xattr<ObjectID: FsVerityHashValue>(
     }
     // At this point we know the xattr is named trusted.overlay.metacopy.
     let value_bytes = xattr.value()?;
+    if value_bytes.is_empty() {
+        return Ok(None);
+    }
     let value = match OverlayMetacopy::<ObjectID>::read_from_bytes(value_bytes) {
         Ok(v) => v,
         Err(_) if strict => {
@@ -1837,8 +1889,19 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                             digest,
                             child_inode.size(),
                         ))
+                    } else if let Some(id) =
+                        extract_redirect_object_id::<ObjectID>(img, &child_inode)?
+                    {
+                        tree::LeafContent::Regular(tree::RegularFile::ExternalNoVerity(
+                            id,
+                            child_inode.size(),
+                        ))
+                    } else if child_inode.data_layout()? == DataLayout::ChunkBased {
+                        tree::LeafContent::Regular(tree::RegularFile::Sparse(child_inode.size()))
                     } else {
-                        if img.composefs_restricted {
+                        if img.composefs_restricted
+                            && img.header.composefs_version == COMPOSEFS_VERSION
+                        {
                             let size = child_inode.size();
                             if size > MAX_INLINE_CONTENT as u64 {
                                 anyhow::bail!(
@@ -1854,8 +1917,11 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                     }
                 }
                 S_IFLNK => {
-                    let target_data = child_inode.inline().unwrap_or(&[]);
-                    if target_data.len() > crate::SYMLINK_MAX {
+                    let target_data = extract_all_file_data(img, &child_inode)?;
+                    if img.composefs_restricted
+                        && img.header.composefs_version == COMPOSEFS_VERSION
+                        && target_data.len() > crate::SYMLINK_MAX
+                    {
                         anyhow::bail!(
                             "symlink target for {:?} is {} bytes (max {})",
                             name,
@@ -1863,7 +1929,7 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                             crate::SYMLINK_MAX,
                         );
                     }
-                    let target = OsStr::from_bytes(target_data);
+                    let target = OsStr::from_bytes(&target_data);
                     tree::LeafContent::Symlink(Box::from(target))
                 }
                 S_IFBLK => tree::LeafContent::BlockDevice(child_inode.u() as u64),
