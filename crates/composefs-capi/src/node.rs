@@ -7,6 +7,12 @@ use libc::{self, size_t, timespec};
 use crate::errno::set_errno;
 use crate::{FfiNode, FfiXattr, LCFS_DIGEST_SIZE};
 
+// EROFS xattr on-disk overhead constants, matching the C library.
+const LCFS_INODE_XATTRMETA_SIZE: usize = 4;
+const LCFS_XATTR_HEADER_SIZE: usize = 12;
+const LCFS_INODE_EXTERNAL_XATTR_MAX: usize = u16::MAX as usize / 2; // 32767
+const XATTR_NAME_MAX: usize = 255;
+
 // ---------------------------------------------------------------------------
 // Node lifecycle
 // ---------------------------------------------------------------------------
@@ -78,6 +84,7 @@ pub unsafe extern "C" fn lcfs_node_clone(node: *mut FfiNode) -> *mut FfiNode {
                     value: x.value.clone(),
                 })
                 .collect(),
+            xattr_size: src.xattr_size,
             mode: src.mode,
             uid: src.uid,
             gid: src.gid,
@@ -97,6 +104,12 @@ pub unsafe extern "C" fn lcfs_node_clone(node: *mut FfiNode) -> *mut FfiNode {
     }
 }
 
+/// Mapping of (old node pointer -> new cloned node pointer) used during deep clone
+/// to rewrite hardlink targets after cloning.
+struct CloneMapping {
+    entries: Vec<(*mut FfiNode, *mut FfiNode)>,
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lcfs_node_clone_deep(node: *mut FfiNode) -> *mut FfiNode {
     if node.is_null() {
@@ -104,16 +117,34 @@ pub unsafe extern "C" fn lcfs_node_clone_deep(node: *mut FfiNode) -> *mut FfiNod
         return ptr::null_mut();
     }
 
+    let mut mapping = CloneMapping {
+        entries: Vec::new(),
+    };
+
+    unsafe {
+        let cloned = clone_deep_inner(node, &mut mapping);
+        if !cloned.is_null() {
+            // Rewrite hardlink targets so they point to the cloned tree, not the old one
+            clone_rewrite_links(cloned, &mapping);
+        }
+        cloned
+    }
+}
+
+unsafe fn clone_deep_inner(node: *mut FfiNode, mapping: &mut CloneMapping) -> *mut FfiNode {
     unsafe {
         let cloned = lcfs_node_clone(node);
         if cloned.is_null() {
             return ptr::null_mut();
         }
 
+        // Record the old -> new mapping
+        mapping.entries.push((node, cloned));
+
         // Deep-clone all children
         let src = &*node;
         for child_ptr in &src.children {
-            let child_clone = lcfs_node_clone_deep(*child_ptr);
+            let child_clone = clone_deep_inner(*child_ptr, mapping);
             if child_clone.is_null() {
                 lcfs_node_unref(cloned);
                 return ptr::null_mut();
@@ -131,6 +162,30 @@ pub unsafe extern "C" fn lcfs_node_clone_deep(node: *mut FfiNode) -> *mut FfiNod
         }
 
         cloned
+    }
+}
+
+/// Walk the cloned tree and rewrite any hardlink_target pointers that refer to
+/// nodes in the old tree so they point to the corresponding cloned nodes.
+unsafe fn clone_rewrite_links(node: *mut FfiNode, mapping: &CloneMapping) {
+    unsafe {
+        // Recurse into children first
+        for &child in &(*node).children {
+            clone_rewrite_links(child, mapping);
+        }
+
+        // Rewrite this node's hardlink target if it maps to a cloned node
+        if let Some(target) = (*node).hardlink_target {
+            let old_target = target.as_ptr();
+            for &(old, new) in &mapping.entries {
+                if old == old_target {
+                    // Unref old target, ref new target
+                    lcfs_node_unref(old_target);
+                    (*node).hardlink_target = NonNull::new(lcfs_node_ref(new));
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -344,6 +399,15 @@ pub unsafe extern "C" fn lcfs_node_get_xattr(
     ptr::null()
 }
 
+/// Compute the EROFS on-disk overhead for an xattr entry.
+fn xattr_entry_size(namelen: usize, value_len: usize, is_first: bool) -> usize {
+    let mut size = (2 * LCFS_INODE_XATTRMETA_SIZE) - 1 + namelen + value_len;
+    if is_first {
+        size += LCFS_XATTR_HEADER_SIZE;
+    }
+    size
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lcfs_node_set_xattr(
     node: *mut FfiNode,
@@ -357,6 +421,20 @@ pub unsafe extern "C" fn lcfs_node_set_xattr(
     }
     unsafe {
         let name_cstr = CStr::from_ptr(name);
+        let namelen = name_cstr.to_bytes().len();
+
+        // Validate name length
+        if namelen == 0 || namelen > XATTR_NAME_MAX {
+            set_errno(libc::ERANGE);
+            return -1;
+        }
+
+        // Validate value length
+        if value_len > u16::MAX as usize {
+            set_errno(libc::EINVAL);
+            return -1;
+        }
+
         let key = match CString::new(name_cstr.to_bytes()) {
             Ok(k) => k,
             Err(_) => {
@@ -370,13 +448,32 @@ pub unsafe extern "C" fn lcfs_node_set_xattr(
             std::slice::from_raw_parts(value as *const u8, value_len).to_vec()
         };
 
-        // Update existing or insert new
+        // Update existing — adjust tracked xattr_size for the value change
         for xattr in &mut (*node).xattrs {
             if xattr.key.as_c_str() == name_cstr {
+                let is_only = (*node).xattrs.len() == 1;
+                let old_entry = xattr_entry_size(namelen, xattr.value.len(), is_only);
+                let new_entry = xattr_entry_size(namelen, val.len(), is_only);
+                let new_total = (*node).xattr_size - old_entry + new_entry;
+                if new_total > LCFS_INODE_EXTERNAL_XATTR_MAX {
+                    set_errno(libc::ERANGE);
+                    return -1;
+                }
+                (*node).xattr_size = new_total;
                 xattr.value = val;
                 return 0;
             }
         }
+
+        // Inserting new — check cumulative size limit
+        let is_first = (*node).xattrs.is_empty();
+        let entry_size = xattr_entry_size(namelen, value_len, is_first);
+        if (*node).xattr_size + entry_size > LCFS_INODE_EXTERNAL_XATTR_MAX {
+            set_errno(libc::ERANGE);
+            return -1;
+        }
+
+        (*node).xattr_size += entry_size;
         (*node).xattrs.push(FfiXattr { key, value: val });
     }
     0
@@ -390,11 +487,26 @@ pub unsafe extern "C" fn lcfs_node_unset_xattr(node: *mut FfiNode, name: *const 
     }
     unsafe {
         let name_cstr = CStr::from_ptr(name);
-        let orig_len = (*node).xattrs.len();
-        (*node).xattrs.retain(|x| x.key.as_c_str() != name_cstr);
-        if (*node).xattrs.len() == orig_len {
-            set_errno(libc::ENODATA);
-            return -1;
+        let pos = (*node)
+            .xattrs
+            .iter()
+            .position(|x| x.key.as_c_str() == name_cstr);
+        match pos {
+            Some(idx) => {
+                let removed = (*node).xattrs.remove(idx);
+                let namelen = removed.key.as_bytes().len();
+                let was_last = (*node).xattrs.is_empty();
+                let mut entry_size = xattr_entry_size(namelen, removed.value.len(), false);
+                // If this was the last xattr removed, also subtract the header overhead
+                if was_last {
+                    entry_size += LCFS_XATTR_HEADER_SIZE;
+                }
+                (*node).xattr_size = (*node).xattr_size.saturating_sub(entry_size);
+            }
+            None => {
+                set_errno(libc::ENODATA);
+                return -1;
+            }
         }
     }
     0
@@ -441,7 +553,12 @@ pub unsafe extern "C" fn lcfs_node_set_payload(
         if payload.is_null() {
             (*node).payload = None;
         } else {
-            (*node).payload = Some(CStr::from_ptr(payload).to_owned());
+            let cstr = CStr::from_ptr(payload);
+            if cstr.to_bytes().len() >= libc::PATH_MAX as usize {
+                set_errno(libc::ENAMETOOLONG);
+                return -1;
+            }
+            (*node).payload = Some(cstr.to_owned());
         }
     }
     0
@@ -452,7 +569,26 @@ pub unsafe extern "C" fn lcfs_node_set_symlink_payload(
     node: *mut FfiNode,
     payload: *const c_char,
 ) -> c_int {
-    unsafe { lcfs_node_set_payload(node, payload) }
+    if node.is_null() {
+        set_errno(libc::EINVAL);
+        return -1;
+    }
+    unsafe {
+        // Symlink target must be non-NULL and non-empty
+        if payload.is_null() || *payload == 0 {
+            set_errno(libc::EINVAL);
+            return -1;
+        }
+        let ret = lcfs_node_set_payload(node, payload);
+        if ret < 0 {
+            return ret;
+        }
+        // Update size to match the symlink payload length, matching C behavior
+        if let Some(ref p) = (*node).payload {
+            (*node).size = p.as_bytes().len() as u64;
+        }
+    }
+    0
 }
 
 #[unsafe(no_mangle)]

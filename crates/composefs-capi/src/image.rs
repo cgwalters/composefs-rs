@@ -40,6 +40,10 @@ pub struct LcfsReadOptions {
 }
 
 const LCFS_BUILD_COMPUTE_DIGEST: u32 = 1 << 3;
+const LCFS_VERSION_MAX: u32 = 1;
+// All currently defined flags. The C library defines LCFS_FLAGS_MASK = 0
+// (no flags yet), so any non-zero flags value is invalid.
+const LCFS_FLAGS_MASK: u32 = 0;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lcfs_load_node_from_image(
@@ -214,8 +218,25 @@ unsafe fn ffi_tree_has_whiteout(node: *const FfiNode) -> bool {
 
 unsafe fn write_to_inner(root: *mut FfiNode, options: *mut LcfsWriteOptions) -> c_int {
     unsafe {
-        let opts = &*options;
+        let opts = &mut *options;
         let root_ref = &*root;
+
+        // Check for unknown flags
+        if (opts.flags & !LCFS_FLAGS_MASK) != 0 {
+            set_errno(libc::EINVAL);
+            return -1;
+        }
+
+        // Validate version bounds
+        if opts.version > LCFS_VERSION_MAX || opts.max_version > LCFS_VERSION_MAX {
+            set_errno(libc::EINVAL);
+            return -1;
+        }
+
+        // Clamp max_version up to at least version
+        if opts.max_version < opts.version {
+            opts.max_version = opts.version;
+        }
 
         // Convert FfiNode tree to FileSystem
         let fs = match ffi_tree_to_filesystem(root_ref) {
@@ -238,16 +259,21 @@ unsafe fn write_to_inner(root: *mut FfiNode, options: *mut LcfsWriteOptions) -> 
         // C library auto-bumps version from 0 to 1 when the tree contains
         // chardev whiteouts (S_IFCHR, rdev=0) and max_version >= 1.
         let mut effective_version = opts.version;
-        if effective_version < 1 && opts.max_version >= 1 {
-            if ffi_tree_has_whiteout(root) {
-                effective_version = 1;
-            }
+        if effective_version < 1 && opts.max_version >= 1 && ffi_tree_has_whiteout(root) {
+            effective_version = 1;
         }
+
+        // Write back the effective version so the caller can observe it
+        opts.version = effective_version;
 
         let version = match effective_version {
             0 => FormatVersion::V0,
             1 => FormatVersion::V1,
-            _ => FormatVersion::V0,
+            _ => {
+                // Should not be reachable after bounds check above
+                set_errno(libc::EINVAL);
+                return -1;
+            }
         };
 
         // Generate the EROFS image

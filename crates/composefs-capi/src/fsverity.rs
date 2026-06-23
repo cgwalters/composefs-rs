@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::io::{Read, Seek};
+use std::io::Read;
 use std::mem::ManuallyDrop;
 use std::os::fd::{BorrowedFd, FromRawFd};
 
@@ -44,11 +44,8 @@ pub unsafe extern "C" fn lcfs_compute_fsverity_from_fd(digest: *mut u8, fd: c_in
         return -1;
     }
 
+    // Match C behavior: read from the current offset position, do not seek.
     let mut file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-    if file.seek(std::io::SeekFrom::Start(0)).is_err() {
-        set_errno(libc::EIO);
-        return -1;
-    }
     let mut data = Vec::new();
     if file.read_to_end(&mut data).is_err() {
         set_errno(libc::EIO);
